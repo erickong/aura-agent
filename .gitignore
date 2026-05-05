@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Aura runtime data
+.aura/
+memory/
+state/
+workspace/
+projects/
+archive/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.secret
+credentials.json
+
+# Logs
+*.log
+logs/
+
+# Local backups and generated reports
+*.bak
+*.bak2
+changelog_overview.md

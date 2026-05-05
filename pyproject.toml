@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura-agent"
+version = "0.1.0"
+description = "Evidence-driven autonomous task orchestrator with bounded worker processes"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "psutil>=5.9.0",
+    "Jinja2>=3.1.0",
+]
+
+[project.scripts]
+aura = "orchestrator.main:main"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
+
+[tool.setuptools.package-data]
+orchestrator = ["templates/*.md"]
