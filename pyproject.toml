@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aura-agent"
 version = "0.1.0"
-description = "Evidence-driven autonomous task orchestrator with bounded worker processes"
+description = "DeepSeek-powered goal-driven agent for long-running tasks, intelligent task decomposition, and autonomous execution"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
