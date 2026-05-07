@@ -17,13 +17,14 @@ from typing import Optional
 
 from jinja2 import Environment, FileSystemLoader
 
-from .config import STATE_DIR, PROJECT_ROOT
+from .config import DATA_DIR, STATE_DIR, PROJECT_ROOT
 from . import state as state_mgr
 from . import memory as memory_mgr
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "progress.template.md")
 PROGRESS_PATH = os.path.join(STATE_DIR, "progress.md")
+LEGACY_PROGRESS_PATH = os.path.join(DATA_DIR, "progress.md")
 
 # ── T0 optimization: on-demand rendering cache ─────────────────────────
 # _last_progress_hash: content hash of the task tree + decision log from
@@ -66,6 +67,8 @@ def render_progress() -> str:
     if (current_hash == _last_progress_hash and
             template_mtime == _last_template_mtime and
             os.path.exists(PROGRESS_PATH)):
+        _remove_legacy_progress_copy()
+        _sync_final_report(state)
         # Nothing meaningful changed — re-read the existing file content
         # rather than re-rendering, but DON'T write (avoids disk I/O).
         with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
@@ -102,6 +105,7 @@ def render_progress() -> str:
 
     content = template.render(
         mission=state.get("mission", "未设定"),
+        project_context=state.get("project_context", {}),
         updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total_cycles=state.get("total_cycles", 0),
         total_hours=total_hours,
@@ -119,7 +123,31 @@ def render_progress() -> str:
     with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
         f.write(content)
 
+    _remove_legacy_progress_copy()
+    _sync_final_report(state)
     return content
+
+
+def _remove_legacy_progress_copy() -> None:
+    """Keep state/progress.md as the only canonical progress report."""
+    try:
+        if (
+            os.path.exists(LEGACY_PROGRESS_PATH)
+            and os.path.normcase(os.path.abspath(LEGACY_PROGRESS_PATH))
+            != os.path.normcase(os.path.abspath(PROGRESS_PATH))
+        ):
+            os.remove(LEGACY_PROGRESS_PATH)
+    except OSError:
+        pass
+
+
+def _sync_final_report(state: dict) -> None:
+    """Best-effort rolling final report for the summaries directory."""
+    try:
+        from .task_reporter import generate_final_report
+        generate_final_report(state)
+    except Exception:
+        pass
 
 
 def _count_by_status(tasks: list, status: str) -> int:
@@ -146,6 +174,10 @@ def _render_task_tree_flat(tasks: list, depth: int = 0) -> list[dict]:
         "killed": "💀",
     }
     for task in tasks:
+        strike = (
+            task.get("status") == "archived"
+            and task.get("previous_status") != "completed"
+        )
         item = {
             "depth": depth,
             "id": task.get("id", "?"),
@@ -154,6 +186,7 @@ def _render_task_tree_flat(tasks: list, depth: int = 0) -> list[dict]:
             "icon": status_icons.get(task.get("status", "pending"), "❓"),
             "indent": "  " * depth + ("└─" if depth > 0 else ""),
             "has_children": bool(task.get("children")),
+            "strike": strike,
         }
         result.append(item)
         if "children" in task and task["children"]:

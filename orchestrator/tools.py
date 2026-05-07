@@ -23,7 +23,7 @@ from .file_cache import cached_read_file, cached_list_directory, invalidate_cach
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Read the contents of a file. Use this to inspect state, progress, memory, or task outputs before making decisions.",
+        "description": "Read the contents of a file. Use this to inspect current-task state, progress, memory, or task outputs before making decisions. Other .aura task directories are isolated except their memory files.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -55,7 +55,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "list_directory",
-        "description": "List contents of a directory. Use this to explore workspace, check task outputs, or discover available files.",
+        "description": "List contents of a directory. Use this to explore current-task workspace, check task outputs, or discover available files. Other .aura task directories are isolated except their memory files.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -94,7 +94,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Unique task ID, e.g. 'T1' or 'T2.1'."
+                    "description": "Unique task ID from the current task tree, e.g. 'A1', 'A1.1', or 'B2'."
                 },
                 "description": {
                     "type": "string",
@@ -161,7 +161,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "decompose_task",
-        "description": "Break a task into smaller subtasks. Each subtask should have clear, verifiable acceptance criteria.",
+        "description": "Break a task into smaller subtasks. Use parent_task_id='root' to create or extend the top-level plan from task.md. Each subtask should have clear, verifiable acceptance criteria.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -174,7 +174,7 @@ TOOL_DEFINITIONS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Unique subtask ID."},
+                            "id": {"type": "string", "description": "Unique subtask ID. Children should keep the parent prefix, e.g. A1 -> A1.1, B2 -> B2.1."},
                             "description": {"type": "string", "description": "What this subtask does."},
                             "acceptance_criteria": {"type": "string", "description": "How to verify completion (verifiable outputs)."}
                         },
@@ -184,6 +184,36 @@ TOOL_DEFINITIONS = [
                 }
             },
             "required": ["parent_task_id", "subtasks"]
+        }
+    },
+    {
+        "name": "update_project_context",
+        "description": "Persist project-level context extracted from task.md: final goal, success criteria, global constraints, and execution environment. Use this during planning before spawning work, especially when task.md mentions commands, API keys, env vars, working directories, models, or required tools.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "final_goal": {
+                    "type": "string",
+                    "description": "The ultimate goal the whole project must achieve."
+                },
+                "success_criteria": {
+                    "type": "string",
+                    "description": "How to know the final goal is truly achieved; include measurable thresholds and acceptance tests."
+                },
+                "global_constraints": {
+                    "type": "string",
+                    "description": "Project-wide constraints, architectural requirements, forbidden approaches, or persistent assumptions."
+                },
+                "execution_environment": {
+                    "type": "string",
+                    "description": "Commands, env vars, API key names/usages, working directories, models, runtimes, or setup steps needed by workers."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Other durable planning context that future cycles and workers must preserve."
+                }
+            },
+            "required": ["final_goal"]
         }
     },
     {
@@ -230,12 +260,82 @@ TOOL_DEFINITIONS = [
 
 def _resolve_path(path: str) -> str:
     """Resolve a project-relative path to an absolute path."""
-    from .config import PROJECT_ROOT
-    return os.path.normpath(os.path.join(PROJECT_ROOT, path))
+    from .config import DATA_DIR, PROJECT_ROOT
+
+    normalized = os.path.normpath(path or ".")
+    parts = normalized.split(os.sep)
+    if os.altsep:
+        parts = normalized.replace(os.altsep, os.sep).split(os.sep)
+
+    if len(parts) >= 2 and parts[0] == ".aura" and parts[1] in {
+        "state",
+        "memory",
+        "workspace",
+        "summaries",
+        "projects",
+        "cache",
+    }:
+        return os.path.normpath(os.path.join(DATA_DIR, *parts[1:]))
+
+    if os.path.isabs(normalized):
+        return normalized
+    return os.path.normpath(os.path.join(PROJECT_ROOT, normalized))
+
+
+def _other_aura_task_path_error(path: str, operation: str) -> str | None:
+    """Return an error if a tool request targets another task file's Aura data.
+
+    Other task directories may expose memory for lessons, but their state,
+    workspace, progress, summaries, and metadata are not current-task evidence.
+    """
+    from .config import DATA_DIR, PROJECT_ROOT
+
+    normalized = os.path.normpath(path or ".")
+    if os.path.isabs(normalized):
+        try:
+            rel = os.path.relpath(normalized, PROJECT_ROOT)
+        except ValueError:
+            return None
+    else:
+        rel = normalized
+
+    rel = rel.replace(os.altsep or os.sep, os.sep)
+    parts = [part for part in rel.split(os.sep) if part and part != "."]
+    if len(parts) < 2 or parts[0] != ".aura":
+        return None
+
+    legacy_current_aliases = {
+        "state",
+        "memory",
+        "workspace",
+        "summaries",
+        "projects",
+        "cache",
+    }
+    if parts[1] in legacy_current_aliases:
+        return None
+
+    current_data_name = os.path.basename(os.path.normpath(DATA_DIR))
+    if parts[1] == current_data_name:
+        return None
+
+    # Allow reading/listing other task memory as lesson material only. Writes
+    # should go through current-task memory/project context.
+    if operation in {"read", "list"} and len(parts) >= 3 and parts[2] == "memory":
+        return None
+
+    return (
+        f"ERROR: Refusing to {operation} another task file's Aura data: {path}. "
+        "During planning, use the current Aura data directory as source of "
+        "truth. You may read .aura/<other-task>/memory/... only for lessons."
+    )
 
 
 def impl_read_file(path: str) -> str:
     """Read a file and return its contents (mtime-cached)."""
+    error = _other_aura_task_path_error(path, "read")
+    if error:
+        return error
     abs_path = _resolve_path(path)
     content = cached_read_file(abs_path)
     if content is None:
@@ -247,6 +347,9 @@ def impl_read_file(path: str) -> str:
 
 def impl_write_file(path: str, content: str) -> str:
     """Write content to a file. Creates parent directories if needed."""
+    error = _other_aura_task_path_error(path, "write")
+    if error:
+        return error
     abs_path = _resolve_path(path)
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     try:
@@ -260,6 +363,9 @@ def impl_write_file(path: str, content: str) -> str:
 
 def impl_list_directory(path: str) -> str:
     """List directory contents (mtime-cached)."""
+    error = _other_aura_task_path_error(path, "list")
+    if error:
+        return error
     abs_path = _resolve_path(path)
     if not os.path.exists(abs_path):
         return f"ERROR: Directory not found: {path}"
@@ -287,6 +393,25 @@ def impl_list_directory(path: str) -> str:
 def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) -> str:
     """Spawn a Layer 2 Claude Code worker."""
     from .config import DEFAULT_MAX_TURNS, MAX_CONCURRENT_TASKS
+
+    state = state_mgr.load_state()
+    task = state_mgr.find_task(task_id, state.get("tasks", []))
+    if task is None:
+        return (
+            f"ERROR: Task {task_id} not found in the current task tree. "
+            "Use only task IDs shown in the current state snapshot."
+        )
+    if task.get("status") in {"completed", "archived"}:
+        return f"ERROR: Task {task_id} is {task.get('status')} and cannot be spawned."
+
+    project_context = state.get("project_context", {}) or {}
+    project_context_text = "\n".join([
+        f"- Final goal: {project_context.get('final_goal') or '(not set)'}",
+        f"- Success criteria: {project_context.get('success_criteria') or '(not set)'}",
+        f"- Global constraints: {project_context.get('global_constraints') or '(not set)'}",
+        f"- Execution environment: {project_context.get('execution_environment') or '(not set)'}",
+        f"- Notes: {project_context.get('notes') or '(not set)'}",
+    ])
 
     # ── Guard: check actual running worker count ─────────────────────
     running = [w for w in process_mgr.list_all() if w.get("running")]
@@ -328,6 +453,18 @@ Specifically:
 # Task {task_id}
 
 {description}
+
+## Project Context
+{project_context_text}
+
+Project Context is background and constraints only. Your assigned work is the
+specific Task {task_id} above. Do not attempt the whole final goal unless this
+task explicitly asks you to do so.
+
+Do not inspect other task-file data directories under `.aura` for state,
+progress, workspace outputs, summaries, caches, or task metadata. Other task
+directories' memory files may be used only as transferable lessons, not as
+current-task evidence.
 
 ## Constraints
 - Budget: {budget_minutes} minutes
@@ -422,6 +559,23 @@ def impl_decompose_task(parent_task_id: str, subtasks: list[dict]) -> str:
     return state_mgr.decompose_task(parent_task_id, subtasks)
 
 
+def impl_update_project_context(
+    final_goal: str = "",
+    success_criteria: str = "",
+    global_constraints: str = "",
+    execution_environment: str = "",
+    notes: str = "",
+) -> str:
+    """Update project-level context extracted by the orchestrator LLM."""
+    return state_mgr.update_project_context(
+        final_goal=final_goal,
+        success_criteria=success_criteria,
+        global_constraints=global_constraints,
+        execution_environment=execution_environment,
+        notes=notes,
+    )
+
+
 def impl_write_memory(mem_type: str, content: str) -> str:
     """Write to long-term memory."""
     return memory_mgr.append_memory(mem_type, content)
@@ -503,6 +657,7 @@ TOOL_IMPLS = {
     "list_running_tasks": impl_list_running_tasks,
     "update_task_tree": impl_update_task_tree,
     "decompose_task": impl_decompose_task,
+    "update_project_context": impl_update_project_context,
     "write_memory": impl_write_memory,
     "no_op": impl_no_op,
 }

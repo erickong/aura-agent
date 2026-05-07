@@ -6,6 +6,13 @@
 
 ## 2. Project Status Overview
 
+## Project Context
+
+- **Final goal**: {{ project_context.get('final_goal') or '(not set)' }}
+- **Success criteria**: {{ project_context.get('success_criteria') or '(not set)' }}
+- **Global constraints**: {{ project_context.get('global_constraints') or '(not set)' }}
+- **Execution environment**: {{ project_context.get('execution_environment') or '(not set)' }}
+
 | Indicator | Value |
 |------|------|
 | Total Elapsed | {{ total_hours }} hours |
@@ -19,7 +26,11 @@
 ## 3. Task Tree Overview
 
 {% for task in task_tree %}
+{% if task.strike %}
+{{ task.indent }}{{ task.icon }} ~~[{{ task.id }}] {{ task.description }} - {{ task.status }}~~
+{% else %}
 {{ task.indent }}{{ task.icon }} [{{ task.id }}] {{ task.description }} — {{ task.status }}
+{% endif %}
 {% endfor %}
 
 ## 4. Active Task Details

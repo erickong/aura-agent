@@ -15,6 +15,7 @@ is invalidated on save and when file mtime changes.
 
 import copy
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from .config import STATE_DIR, MAX_CONCURRENT_TASKS
 
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 STATE_BAK_PATH = os.path.join(STATE_DIR, "state.json.bak")
+DEFAULT_TASK_BATCH_PREFIX = "A"
 
 # ── T0 optimization: in-memory state cache with mtime invalidation ────
 # _state_cache holds the last known state dict (deep copy, never mutated by
@@ -35,6 +37,111 @@ STATE_BAK_PATH = os.path.join(STATE_DIR, "state.json.bak")
 # is returned directly — avoiding JSON parse + disk I/O.
 _state_cache: Optional[dict] = None
 _state_mtime: float = 0.0
+
+
+def _batch_prefix_for_index(index: int) -> str:
+    """Return spreadsheet-style batch letters: A..Z, AA..AZ, BA..."""
+    index = max(0, int(index))
+    chars = []
+    while True:
+        index, remainder = divmod(index, 26)
+        chars.append(chr(ord("A") + remainder))
+        if index == 0:
+            break
+        index -= 1
+    return "".join(reversed(chars))
+
+
+def _batch_index_for_prefix(prefix: str) -> int:
+    prefix = (prefix or DEFAULT_TASK_BATCH_PREFIX).upper()
+    total = 0
+    for char in prefix:
+        if not ("A" <= char <= "Z"):
+            return 0
+        total = total * 26 + (ord(char) - ord("A") + 1)
+    return max(0, total - 1)
+
+
+def _task_file_hash(task_file: str) -> str:
+    try:
+        with open(task_file, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _ensure_task_batch_state(state: dict) -> dict:
+    batch = state.setdefault("task_batch", {})
+    prefix = str(batch.get("current_prefix") or DEFAULT_TASK_BATCH_PREFIX).upper()
+    index = batch.get("current_index")
+    if not isinstance(index, int):
+        index = _batch_index_for_prefix(prefix)
+    prefix = _batch_prefix_for_index(index)
+    batch["current_index"] = index
+    batch["current_prefix"] = prefix
+    batch.setdefault("last_task_file_hash", "")
+    return batch
+
+
+def _advance_task_batch_for_change(state: dict, task_file: str, changed: bool) -> bool:
+    batch = _ensure_task_batch_state(state)
+    current_hash = _task_file_hash(task_file)
+    previous_hash = batch.get("last_task_file_hash", "")
+    if current_hash and not previous_hash and not changed:
+        batch["last_task_file_hash"] = current_hash
+    if not changed or not current_hash:
+        return False
+    if previous_hash == current_hash:
+        return False
+
+    batch["current_index"] = int(batch.get("current_index", 0)) + 1
+    batch["current_prefix"] = _batch_prefix_for_index(batch["current_index"])
+    batch["last_task_file_hash"] = current_hash
+    batch["advanced_at"] = datetime.now().isoformat()
+    return True
+
+
+def _current_task_batch_prefix(state: dict) -> str:
+    return _ensure_task_batch_state(state)["current_prefix"]
+
+
+def _iter_tasks(tasks: list):
+    for task in tasks:
+        yield task
+        yield from _iter_tasks(task.get("children", []))
+
+
+def _all_task_ids(tasks: list) -> set[str]:
+    return {str(task.get("id", "")) for task in _iter_tasks(tasks)}
+
+
+def _next_top_level_task_id(root: dict, prefix: str, existing_ids: set[str]) -> str:
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    max_num = 0
+    for child in root.get("children", []):
+        match = pattern.fullmatch(str(child.get("id", "")))
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+
+    num = max_num + 1
+    while f"{prefix}{num}" in existing_ids:
+        num += 1
+    return f"{prefix}{num}"
+
+
+def _next_child_task_id(parent: dict, existing_ids: set[str]) -> str:
+    parent_id = str(parent.get("id", ""))
+    pattern = re.compile(rf"^{re.escape(parent_id)}\.(\d+)$")
+    max_num = 0
+    for child in parent.get("children", []):
+        match = pattern.fullmatch(str(child.get("id", "")))
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+
+    num = max_num + 1
+    while f"{parent_id}.{num}" in existing_ids:
+        num += 1
+    return f"{parent_id}.{num}"
 
 
 def load_state() -> dict:
@@ -145,10 +252,23 @@ def _empty_state() -> dict:
     """Create an empty initial state."""
     return {
         "mission": "",
+        "project_context": {
+            "final_goal": "",
+            "success_criteria": "",
+            "global_constraints": "",
+            "execution_environment": "",
+            "notes": "",
+            "updated_at": "",
+        },
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
         "total_cycles": 0,
         "task_file": "",
+        "task_batch": {
+            "current_index": 0,
+            "current_prefix": DEFAULT_TASK_BATCH_PREFIX,
+            "last_task_file_hash": "",
+        },
         "tasks": [],
         "active_tasks": [],
         "decision_log": [],
@@ -350,32 +470,11 @@ def parse_requirement_blocks(task_file: str) -> list[dict]:
     return [b for b in blocks if b["text"].strip()]
 
 
-def _task_nodes_from_file(task_file: str) -> list[dict]:
-    blocks = parse_requirement_blocks(task_file)
-    nodes = []
-    for idx, block in enumerate(blocks, start=1):
-        if _is_completion_directive(block["text"]):
-            continue
-        nodes.append({
-            "id": f"T{len(nodes) + 1}",
-            "description": block["text"],
-            "status": block.get("status", "pending"),
-            "depth": 1,
-            "created_at": datetime.now().isoformat(),
-            "children": [],
-            "source": {
-                "task_file": task_file,
-                "line_num": block.get("line_num"),
-                "type": block.get("type"),
-            },
-            "acceptance_criteria": "Implement this requirement and provide verifiable evidence.",
-        })
-    return nodes
-
-
 def init_state(mission: str, task_file: str = "") -> dict:
     """Initialize a new state with a mission."""
     state = _empty_state()
+    batch = _ensure_task_batch_state(state)
+    batch["last_task_file_hash"] = _task_file_hash(task_file)
     state["mission"] = mission
     state["task_file"] = task_file
     state["tasks"] = [{
@@ -384,7 +483,7 @@ def init_state(mission: str, task_file: str = "") -> dict:
         "status": "pending",
         "depth": 0,
         "created_at": datetime.now().isoformat(),
-        "children": _task_nodes_from_file(task_file) if task_file else [],
+        "children": [],
     }]
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     save_state(state)
@@ -404,12 +503,34 @@ def _is_completion_directive(text: str) -> bool:
     return bool(re.search(r"(完成|实现|做完|处理完|搞定|解决)", normalized))
 
 
+def _is_completion_directive(text: str) -> bool:
+    normalized = _normalize_requirement(text)
+    if not re.search(r"(上面|以上|前面|前述|之前|前面的)", normalized):
+        return False
+    if not re.search(r"(已经|已|均已|都已|全部已|全都已)", normalized):
+        return False
+    return bool(re.search(r"(完成|实现|做完|处理完|搞定|解决)", normalized))
+
+
+def _completed_by_user_directive(task: dict) -> bool:
+    evidence = str(task.get("evidence", ""))
+    return evidence.startswith("User stated earlier requirements were already completed")
+
+
 def _completion_directive_lines(task_file: str) -> list[int]:
     return [
         block["line_num"]
         for block in parse_requirement_blocks(task_file)
         if _is_completion_directive(block["text"])
     ]
+
+
+def _is_completion_directive(text: str) -> bool:
+    return False
+
+
+def _completion_directive_lines(task_file: str) -> list[int]:
+    return []
 
 
 def _requirement_similarity(left: str, right: str) -> float:
@@ -448,26 +569,23 @@ def _is_task_file_node(task: dict, task_file: str) -> bool:
     source = task.get("source") or {}
     if os.path.normcase(source.get("task_file", "")) == os.path.normcase(task_file):
         return True
-    return bool(re.fullmatch(r"T\d+", str(task.get("id", "")))) and task.get("depth", 1) == 1
+    return bool(re.fullmatch(r"[A-Z]+\d+", str(task.get("id", "")))) and task.get("depth", 1) == 1
 
 
 def reconcile_task_file(
     task_file: str,
     mission: str = "",
     running_task_ids: set[str] | None = None,
+    task_file_changed: bool = False,
 ) -> dict:
-    """Reconcile the current state with the latest task file.
+    """Record task-file metadata without making semantic planning decisions.
 
-    Startup flow:
-    1. Parse the user's requirement file.
-    2. Preserve existing matching tasks and their evidence/status.
-    3. Add new requirements from the file.
-    4. Archive requirements removed from the file.
-    5. Mark in-progress tasks with no running process as pending so they can
-       be resumed by a new Layer 2 worker.
+    Planning belongs to the orchestrator LLM during run_cycle(). This function
+    only keeps the state ledger coherent: task-file path/hash, current batch,
+    root metadata, stale in-progress recovery, and repair of old auto-complete
+    evidence produced by earlier parser heuristics.
     """
     running_task_ids = running_task_ids or set()
-    desired_nodes = _task_nodes_from_file(task_file)
     stats = {
         "kept": 0,
         "added": 0,
@@ -476,6 +594,11 @@ def reconcile_task_file(
         "interrupted": 0,
         "completed_from_result": 0,
         "completed_by_user_directive": 0,
+        "removed_completed": 0,
+        "reopened_auto_completed": 0,
+        "planning_needed": False,
+        "batch": DEFAULT_TASK_BATCH_PREFIX,
+        "batch_advanced": False,
     }
 
     state = load_state()
@@ -483,113 +606,39 @@ def reconcile_task_file(
         init_state(mission, task_file)
         state = load_state()
 
+    stats["batch_advanced"] = _advance_task_batch_for_change(
+        state, task_file, task_file_changed
+    )
+    current_batch = _current_task_batch_prefix(state)
+    stats["batch"] = current_batch
+
     state["mission"] = mission or state.get("mission", "")
     state["task_file"] = task_file
     root = state["tasks"][0]
     root["description"] = state["mission"]
-    root["status"] = "in_progress" if desired_nodes else root.get("status", "pending")
-
-    old_children = root.get("children", [])
-    by_text: dict[str, dict] = {}
-    by_id: dict[str, dict] = {}
-    task_file_nodes: list[dict] = []
-    other_nodes: list[dict] = []
-
-    for child in old_children:
-        if _is_task_file_node(child, task_file):
-            task_file_nodes.append(child)
-            by_text.setdefault(_normalize_requirement(child.get("description", "")), child)
-            by_id.setdefault(child.get("id", ""), child)
-        else:
-            other_nodes.append(child)
-
-    reconciled: list[dict] = []
-    used_old_ids: set[int] = set()
+    root["status"] = "in_progress"
     now = datetime.now().isoformat()
 
-    for desired in desired_nodes:
-        normalized = _normalize_requirement(desired["description"])
-        old = by_text.get(normalized)
-        if old is not None and id(old) in used_old_ids:
-            old = None
-        if old is None:
-            old = _find_best_requirement_match(desired, task_file_nodes, used_old_ids)
-        if old is None:
-            id_match = by_id.get(desired["id"])
-            if id_match is not None and id(id_match) not in used_old_ids:
-                old = id_match
-
-        if old is None:
-            node = desired
-            stats["added"] += 1
-        else:
-            used_old_ids.add(id(old))
-            node = old
-            old_normalized = _normalize_requirement(node.get("description", ""))
-            node["id"] = desired["id"]
-            node["description"] = desired["description"]
-            node["depth"] = desired["depth"]
-            node["source"] = desired["source"]
-            node.setdefault("children", [])
-            node.setdefault("acceptance_criteria", desired["acceptance_criteria"])
-            if old_normalized == normalized:
-                stats["kept"] += 1
-            else:
-                stats["updated"] += 1
-                if node.get("status") == "completed":
-                    node["status"] = "pending"
-                    node["updated_at"] = now
-                    node["reason"] = "Requirement text changed in task file; reopening."
-
-        task_dir = Path(STATE_DIR).parent / "workspace" / "tasks" / node["id"]
-        result_path = task_dir / "result.md"
-        output_jsonl = task_dir / "output.jsonl"
-        output_txt = task_dir / "output.txt"
-
-        if node.get("status") == "in_progress" and node["id"] not in running_task_ids:
-            if result_path.exists():
-                node["status"] = "completed"
-                node["completed_at"] = now
-                node["evidence"] = str(result_path)
-                stats["completed_from_result"] += 1
-            else:
-                node["status"] = "pending"
-                node["interrupted_at"] = now
-                evidence = []
-                if output_jsonl.exists():
-                    evidence.append(str(output_jsonl))
-                if output_txt.exists():
-                    evidence.append(str(output_txt))
-                node["evidence"] = "; ".join(evidence) if evidence else "Interrupted before completion."
-                stats["interrupted"] += 1
-
-        reconciled.append(node)
-
-    for old in task_file_nodes:
-        if id(old) in used_old_ids:
+    for task in _iter_tasks(state.get("tasks", [])):
+        task.setdefault("children", [])
+        if task.get("id") == "root":
             continue
-        old["status"] = "archived"
-        old["archived_at"] = now
-        old["reason"] = "Requirement no longer appears in task file."
-        reconciled.append(old)
-        stats["archived"] += 1
+        if task.get("status") == "completed" and _completed_by_user_directive(task):
+            task["status"] = "pending"
+            task["updated_at"] = now
+            task["reason"] = "Reopened because parser-based task-file completion directives are disabled."
+            task["evidence"] = "Prior completion evidence came from deprecated parser heuristics."
+            stats["reopened_auto_completed"] += 1
+        if task.get("status") == "in_progress" and task.get("id") not in running_task_ids:
+            task["status"] = "pending"
+            task["interrupted_at"] = now
+            task["evidence"] = "Interrupted before completion; no running process found."
+            stats["interrupted"] += 1
 
-    root["children"] = reconciled + other_nodes
-
-    directive_lines = _completion_directive_lines(task_file)
-    if directive_lines:
-        last_line = max(directive_lines)
-        for child in root["children"]:
-            source = child.get("source") or {}
-            line_num = source.get("line_num")
-            if not isinstance(line_num, int) or line_num >= last_line:
-                continue
-            if child.get("status") in {"completed", "archived"}:
-                continue
-            child["status"] = "completed"
-            child["completed_at"] = now
-            child["evidence"] = f"User stated earlier requirements were already completed in {task_file}:{last_line}"
-            stats["completed_by_user_directive"] += 1
+    root_children = root.get("children", [])
+    if task_file_changed or not root_children or stats["reopened_auto_completed"] > 0:
+        state["task_file_needs_planning"] = True
+    stats["planning_needed"] = bool(state.get("task_file_needs_planning"))
 
     state["active_tasks"] = [t["id"] for t in _collect_in_progress(state["tasks"])]
     save_state(state)
@@ -598,7 +647,8 @@ def reconcile_task_file(
 
 def sync_task_file_tasks(task_file: str) -> int:
     """Backward-compatible wrapper for older callers."""
-    return reconcile_task_file(task_file).get("added", 0)
+    reconcile_task_file(task_file)
+    return 0
 
 
 def find_task(task_id: str, tasks: Optional[list] = None) -> Optional[dict]:
@@ -658,17 +708,61 @@ def update_task(task_id: str, new_status: str, reason: str, evidence: str) -> st
     return f"OK: Task {task_id} updated: {old_status} -> {new_status}. Reason: {reason}"
 
 
+def update_project_context(
+    final_goal: str = "",
+    success_criteria: str = "",
+    global_constraints: str = "",
+    execution_environment: str = "",
+    notes: str = "",
+) -> str:
+    """Persist LLM-extracted project-level planning context."""
+    state = load_state()
+    current = state.setdefault("project_context", {})
+    updates = {
+        "final_goal": final_goal,
+        "success_criteria": success_criteria,
+        "global_constraints": global_constraints,
+        "execution_environment": execution_environment,
+        "notes": notes,
+    }
+    for key, value in updates.items():
+        if value is not None:
+            current[key] = str(value).strip()
+    current["updated_at"] = datetime.now().isoformat()
+    save_state(state)
+    return "OK: Project context updated."
+
+
 def decompose_task(parent_task_id: str, subtasks: list[dict]) -> str:
     """Add subtasks to a parent task node."""
     state = load_state()
+    _ensure_task_batch_state(state)
     parent = find_task(parent_task_id, state["tasks"])
 
     if parent is None:
         return f"ERROR: Parent task {parent_task_id} not found"
 
     new_depth = parent.get("depth", 0) + 1
+    existing_ids = _all_task_ids(state.get("tasks", []))
 
     for st in subtasks:
+        proposed_id = str(st.get("id", "")).strip()
+        if parent.get("id") == "root":
+            valid_prefix = _current_task_batch_prefix(state)
+            valid_id = bool(re.fullmatch(rf"{re.escape(valid_prefix)}\d+", proposed_id))
+            if not proposed_id or proposed_id in existing_ids or not valid_id:
+                proposed_id = _next_top_level_task_id(parent, valid_prefix, existing_ids)
+        else:
+            parent_prefix = f"{parent_task_id}."
+            if (
+                not proposed_id
+                or proposed_id in existing_ids
+                or not proposed_id.startswith(parent_prefix)
+            ):
+                proposed_id = _next_child_task_id(parent, existing_ids)
+
+        st["id"] = proposed_id
+        existing_ids.add(proposed_id)
         st.setdefault("status", "pending")
         st.setdefault("depth", new_depth)
         st.setdefault("created_at", datetime.now().isoformat())
@@ -676,6 +770,8 @@ def decompose_task(parent_task_id: str, subtasks: list[dict]) -> str:
         st.setdefault("children", [])
 
     parent.setdefault("children", []).extend(subtasks)
+    if parent.get("id") == "root":
+        state["task_file_needs_planning"] = False
     save_state(state)
 
     subtask_ids = [st["id"] for st in subtasks]

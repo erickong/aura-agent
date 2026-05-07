@@ -43,9 +43,10 @@ Each wake cycle, follow this structure:
 
 ### 1. SITUATION ASSESSMENT
 - First use the current state snapshot supplied in the user message.
-- Only read .aura/state/progress.md, .aura/state/state.json, memory/session.md, or task directories when the snapshot lacks evidence needed for a decision.
+- Aura data is task-file scoped. If you must read files, use the explicit Aura data directory shown in the context or the provided workspace snapshot. Do not assume legacy `.aura/state` or `.aura/workspace` paths are authoritative.
 - For active tasks, prefer the included Phase 2 signals and workspace/output summaries before making extra tool calls.
-- If there are no active/running/pending tasks and no task-file change, call no_op without extra file reads.
+- If Planning needed is true, update the task tree from the task file before no_op or spawning work.
+- If there are no active/running/pending tasks, no task-file change, and Planning needed is false, call no_op without extra file reads.
 
 ### 2. PROGRESS EVALUATION
 For each active task, evaluate:
@@ -72,10 +73,13 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 ## Rules
 
 - Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
-- Requirements parsed from the user's task file appear as T1, T2, ... in the task tree. Do not ignore pending task-file requirements.
+- The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
+- During planning, first identify and persist project context with update_project_context: final goal, success criteria, global constraints, and execution environment such as commands, env vars/API key usage, models, and working directories.
+- During planning, do not inspect other task-file data directories under `.aura` for current state, progress, workspace outputs, summaries, caches, or task metadata. You may read other task directories' memory files only as lessons, not as evidence for the current task; record any borrowed lesson explicitly in current project context or memory.
+- New top-level tasks use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A tasks keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
 - Preserve and build on existing subtasks, evidence, and completed work. Do not re-plan from scratch just because the task file is broad or edited.
 - Treat completed tasks and result.md evidence as coverage for matching requirements; avoid repeating completed work unless the requirement text materially changed.
-- If the task file explicitly says earlier items are already done, focus on the true incremental requirements below that note.
+- Do not mark tasks completed from task-file wording alone. Completion requires verifiable evidence, worker artifacts, or an explicit user request.
 - If there is free Layer 2 capacity and multiple independent pending requirements exist, start work on up to 2 of them instead of focusing only on the first item.
 - If a task runs 12+ cycles with NO verifiable output → kill it or trigger replanning
 - If the entire project has no effective progress for several hours → comprehensive replanning

@@ -12,11 +12,13 @@ Usage:
     aura projects
     aura history
 
-Data files (memory, state, workspace) are stored under ./.aura/ by default.
+Data files (memory, state, workspace) are stored under a task-specific
+./.aura/<task-file-name>-<path-hash>/ directory by default.
 Override with: aura --data-dir=/path/to/dir start --task-file=...
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -46,6 +48,139 @@ for i, arg in enumerate(_args_for_data):
 
 if _data_dir:
     os.environ["AURA_DATA_DIR"] = os.path.expanduser(_data_dir)
+
+
+def _early_resolve_task_file(task_file: str) -> str:
+    expanded = os.path.expanduser(task_file)
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    return os.path.normpath(os.path.join(PROJECT_ROOT, expanded))
+
+
+def _task_data_slug(task_file: str) -> str:
+    resolved = os.path.abspath(os.path.normcase(task_file))
+    stem = os.path.splitext(os.path.basename(task_file))[0] or "task"
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" ._")
+    stem = re.sub(r"\s+", "_", stem) or "task"
+    suffix = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:8]
+    return f"{stem}-{suffix}"
+
+
+def _default_aura_base_dir() -> str:
+    return os.path.abspath(os.path.join(PROJECT_ROOT, ".aura"))
+
+
+def _active_task_data_marker(base_dir: str) -> str:
+    return os.path.join(base_dir, ".active_task_data_dir")
+
+
+def _task_index_path(base_dir: str) -> str:
+    return os.path.join(base_dir, "task_index.json")
+
+
+def _task_data_dir_for(task_file: str, base_dir: str | None = None) -> str:
+    base = os.path.abspath(os.path.expanduser(base_dir or _default_aura_base_dir()))
+    return os.path.join(base, _task_data_slug(task_file))
+
+
+def _detect_task_arg(argv: list[str]) -> str | None:
+    known_commands = {
+        "start", "restart", "status", "progress", "projects", "history",
+        "changelog", "cleanup", "wake", "setup", "summaries", "cache-stats",
+        "changelog-overview", "clean-workspaces",
+    }
+    option_takes_value = {"--config", "-c", "--data-dir", "--task-file"}
+    command = None
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            if command in {"start", "restart"} and argv[i - 1] == "--task-file":
+                return arg
+            skip_next = False
+            continue
+        if arg in option_takes_value:
+            skip_next = True
+            continue
+        if arg.startswith("--task-file="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("-"):
+            continue
+        if command in {"start", "restart"}:
+            return arg
+        if arg in known_commands:
+            command = arg
+            continue
+        return arg
+    return None
+
+
+def _select_task_data_dir_before_import() -> None:
+    if _data_dir:
+        return
+
+    base_dir = _default_aura_base_dir()
+    task_arg = _detect_task_arg(sys.argv[1:])
+    if task_arg:
+        task_file = _early_resolve_task_file(task_arg)
+        os.environ["AURA_DATA_DIR"] = _task_data_dir_for(task_file, base_dir)
+        return
+
+    marker = _active_task_data_marker(base_dir)
+    if os.path.exists(marker):
+        try:
+            active_dir = Path(marker).read_text(encoding="utf-8").strip()
+            if active_dir:
+                os.environ["AURA_DATA_DIR"] = active_dir
+        except OSError:
+            pass
+
+
+def _record_task_data_dir(task_file: str, data_dir: str) -> None:
+    if _data_dir:
+        return
+
+    base_dir = _default_aura_base_dir()
+    task_file_abs = os.path.abspath(task_file)
+    data_dir_abs = os.path.abspath(data_dir)
+    os.makedirs(base_dir, exist_ok=True)
+    os.makedirs(data_dir_abs, exist_ok=True)
+
+    metadata = {
+        "task_file": task_file_abs,
+        "task_file_norm": os.path.normcase(task_file_abs),
+        "data_dir": data_dir_abs,
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    metadata_path = os.path.join(data_dir_abs, "task_file.json")
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            metadata["created_at"] = existing.get("created_at") or metadata["updated_at"]
+        except (OSError, json.JSONDecodeError):
+            metadata["created_at"] = metadata["updated_at"]
+    else:
+        metadata["created_at"] = metadata["updated_at"]
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    index_path = _task_index_path(base_dir)
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        index = {"tasks": {}}
+    index.setdefault("tasks", {})[metadata["task_file_norm"]] = metadata
+    index["updated_at"] = metadata["updated_at"]
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+    Path(_active_task_data_marker(base_dir)).write_text(data_dir_abs, encoding="utf-8")
+
+
+_select_task_data_dir_before_import()
 
 
 # ── Early config loading (before config import) ─────────────────────────
@@ -114,6 +249,8 @@ if _config_path:
     print(f"[CONFIG] Loaded environment from: {_config_path}")
 else:
     _load_dotenv_if_exists(GLOBAL_CONFIG_PATH)
+
+_select_task_data_dir_before_import()
 
 
 from orchestrator.config import (
@@ -383,6 +520,14 @@ def _rmtree_force(path: str) -> None:
     shutil.rmtree(path, onerror=_on_rm_error)
 
 
+def _render_progress_safely(reason: str = "") -> None:
+    try:
+        progress_mgr.render_progress()
+    except Exception as err:
+        suffix = f" after {reason}" if reason else ""
+        print(f"  [WARN] Could not render progress{suffix}: {err}")
+
+
 def cmd_start(args):
     """Start the orchestrator main loop."""
     print(get_startup_banner())
@@ -394,6 +539,8 @@ def cmd_start(args):
     if not os.path.exists(task_file_path):
         print(f"[ERROR] Task file not found: {task_file_path}")
         sys.exit(1)
+
+    _record_task_data_dir(task_file_path, DATA_DIR)
 
     mission = _extract_mission(task_file_path)
     if not mission:
@@ -423,6 +570,7 @@ def cmd_start(args):
     print(f"  Project: {project_name}")
     print(f"  Project root: {CFG_PROJECT_ROOT}")
     print(f"  Aura dir: {DATA_DIR}")
+    print(f"  Task data mapping: {os.path.join(DATA_DIR, 'task_file.json')}")
     print(f"  Task file: {task_file_path}")
     active = project_name
 
@@ -463,17 +611,24 @@ def cmd_start(args):
         task_file_path,
         mission=mission,
         running_task_ids=running_task_ids,
+        task_file_changed=change_info["is_changed"],
     )
     print(
         "  [TASKS] Reconciled task file: "
+        f"batch={reconcile_stats.get('batch')}, "
+        f"batch_advanced={reconcile_stats.get('batch_advanced')}, "
         f"kept={reconcile_stats['kept']}, "
         f"added={reconcile_stats['added']}, "
         f"updated={reconcile_stats['updated']}, "
         f"archived={reconcile_stats['archived']}, "
+        f"removed_completed={reconcile_stats.get('removed_completed', 0)}, "
+        f"reopened_auto_completed={reconcile_stats.get('reopened_auto_completed', 0)}, "
+        f"planning_needed={reconcile_stats.get('planning_needed', False)}, "
         f"interrupted={reconcile_stats['interrupted']}, "
         f"completed_from_result={reconcile_stats['completed_from_result']}, "
         f"completed_by_user_directive={reconcile_stats['completed_by_user_directive']}"
     )
+    _render_progress_safely("task file reconcile")
 
     mark_file_processed(task_file_path, PROJECTS_DIR, project_name,
                         summary=f"启动任务: {mission[:60]}")
@@ -519,6 +674,30 @@ def cmd_start(args):
                     diff_preview = wake_change["diff_lines"][:8]
                     for dl in diff_preview:
                         print(f"       {dl[:120]}")
+                running_task_ids = {
+                    worker["task_id"]
+                    for worker in process_mgr.list_all()
+                    if worker.get("running")
+                }
+                reconcile_stats = state_mgr.reconcile_task_file(
+                    task_file_path,
+                    mission=mission,
+                    running_task_ids=running_task_ids,
+                    task_file_changed=True,
+                )
+                print(
+                    "  [TASKS] Reconciled changed task file: "
+                    f"batch={reconcile_stats.get('batch')}, "
+                    f"batch_advanced={reconcile_stats.get('batch_advanced')}, "
+                    f"kept={reconcile_stats['kept']}, "
+                    f"added={reconcile_stats['added']}, "
+                    f"updated={reconcile_stats['updated']}, "
+                    f"archived={reconcile_stats['archived']}, "
+                    f"removed_completed={reconcile_stats.get('removed_completed', 0)}, "
+                    f"reopened_auto_completed={reconcile_stats.get('reopened_auto_completed', 0)}, "
+                    f"planning_needed={reconcile_stats.get('planning_needed', False)}"
+                )
+                _render_progress_safely("changed task file reconcile")
 
             result = run_cycle(wake_change=wake_change)
             cycle_count += 1
@@ -547,6 +726,7 @@ def cmd_start(args):
 
             # ── Layer 2 crash detection ────────────────────────────
             tracked = process_mgr.list_all()
+            worker_status_changed = False
             for worker in tracked:
                 if not worker["running"]:
                     task_id = worker["task_id"]
@@ -565,6 +745,7 @@ def cmd_start(args):
                             state_mgr.update_task(task_id, "completed",
                                 f"Worker finished. Output: {output_size} bytes.",
                                 f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
+                            worker_status_changed = True
                             try:
                                 generate_task_summary(task_id, "completed",
                                     f"Worker finished. Output: {output_size} bytes.",
@@ -579,6 +760,7 @@ def cmd_start(args):
                         try:
                             state_mgr.update_task(task_id, "failed",
                                 f"Worker died after {elapsed}min with no output.", "(no output)")
+                            worker_status_changed = True
                             try:
                                 generate_task_summary(task_id, "failed",
                                     f"Worker died after {elapsed}min with no output.", "(no output)")
@@ -591,6 +773,9 @@ def cmd_start(args):
                     process_mgr._active_processes[task_id]["running"] = False
 
             # ── Hourly deep review ──────────────────────────────
+            if worker_status_changed:
+                _render_progress_safely("worker status update")
+
             if actual_cycle % DEEP_REVIEW_INTERVAL_CYCLES == 0:
                 print(f"\n  {'─'*50}")
                 print(f"  [DEEP REVIEW] 每小时深度审查 (Cycle #{actual_cycle})")
@@ -642,6 +827,7 @@ def cmd_start(args):
             break
         except Exception as e:
             print(f"\n[ERROR] Unexpected crash in cycle: {e}")
+            _render_progress_safely("unexpected cycle crash")
             import traceback
             traceback.print_exc()
 
@@ -663,6 +849,51 @@ def cmd_start(args):
         print(f"  [WARN] Final project save failed: {save_err}")
 
 
+def _clear_task_data_dir(task_file_path: str) -> None:
+    target = os.path.abspath(DATA_DIR)
+    if target in {os.path.abspath(os.sep), os.path.abspath(CFG_PROJECT_ROOT)}:
+        raise RuntimeError(f"Refusing to clear unsafe data directory: {target}")
+
+    metadata_path = os.path.join(target, "task_file.json")
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            recorded = os.path.normcase(os.path.abspath(metadata.get("task_file", "")))
+            requested = os.path.normcase(os.path.abspath(task_file_path))
+            if recorded and recorded != requested:
+                raise RuntimeError(
+                    "Refusing to clear data directory because its task_file.json "
+                    f"points to {metadata.get('task_file')}, not {task_file_path}"
+                )
+        except json.JSONDecodeError as err:
+            raise RuntimeError(f"Refusing to clear data directory with invalid metadata: {err}") from err
+
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(target):
+        path = os.path.join(target, name)
+        if os.path.isdir(path):
+            _rmtree_force(path)
+        else:
+            os.remove(path)
+
+
+def cmd_restart(args):
+    """Clear the task-specific Aura data directory, then start fresh."""
+    task_file_path = _resolve_task_file(args.task_file)
+    if not os.path.exists(task_file_path):
+        print(f"[ERROR] Task file not found: {task_file_path}")
+        sys.exit(1)
+
+    print(f"[RESTART] Clearing Aura data for task file: {task_file_path}")
+    print(f"[RESTART] Data directory: {DATA_DIR}")
+    _kill_running_workers(prefix="[RESTART]")
+    _clear_task_data_dir(task_file_path)
+    _record_task_data_dir(task_file_path, DATA_DIR)
+    print("[RESTART] Data cleared. Starting fresh run.")
+    cmd_start(args)
+
+
 def cmd_status():
     active = _get_active_project()
     if not active:
@@ -679,12 +910,35 @@ def cmd_status():
 
 def cmd_progress():
     progress_mgr.render_progress()
-    print("Progress report written to .aura/state/progress.md")
+    print(f"Progress report written to {os.path.join(STATE_DIR, 'progress.md')}")
 
 
 def cmd_projects():
+    base_dir = _default_aura_base_dir()
+    index_path = _task_index_path(base_dir)
+    active_data_dir = None
+    marker = _active_task_data_marker(base_dir)
+    if os.path.exists(marker):
+        try:
+            active_data_dir = Path(marker).read_text(encoding="utf-8").strip()
+        except OSError:
+            active_data_dir = None
+
+    if os.path.exists(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            print("\n  Task-file data directories:")
+            for item in sorted(index.get("tasks", {}).values(), key=lambda x: x.get("task_file", "")):
+                marker_text = " ACTIVE" if os.path.abspath(item.get("data_dir", "")) == os.path.abspath(active_data_dir or "") else ""
+                print(f"    {item.get('task_file', '?')}")
+                print(f"      -> {item.get('data_dir', '?')}{marker_text}")
+        except (OSError, json.JSONDecodeError) as err:
+            print(f"Could not read task index: {err}")
+
     if not os.path.exists(PROJECTS_DIR):
-        print("No projects yet.")
+        if not os.path.exists(index_path):
+            print("No projects yet.")
         return
     active = _get_active_project()
     print(f"\n  Saved projects:")
@@ -854,7 +1108,7 @@ def _extract_mission(task_file: str) -> str:
 
 def main():
     known_commands = {
-        "start", "status", "progress", "projects", "history", "changelog",
+        "start", "restart", "status", "progress", "projects", "history", "changelog",
         "cleanup", "wake", "setup", "summaries", "cache-stats",
         "changelog-overview", "clean-workspaces",
     }
@@ -876,11 +1130,15 @@ def main():
     parser.add_argument("--config", "-c", help="Path to .env config file", default=None)
     parser.add_argument("--data-dir", default=None,
                         help="Data directory for process files (memory, state, workspace). "
-                             "Default: ./.aura/")
+                             "Default: ./.aura/<task-file-name>-<path-hash>/ for task-file commands.")
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("start", help="Start the orchestrator loop")
     p.add_argument("--task-file", required=True, help="Path to task .md file")
+
+    p_restart = sub.add_parser("restart", help="Clear this task file's Aura data and start fresh")
+    p_restart.add_argument("task_file_pos", nargs="?", help="Path to task .md file")
+    p_restart.add_argument("--task-file", dest="task_file_opt", help="Path to task .md file")
 
     sub.add_parser("status", help="Show current project status")
     sub.add_parser("progress", help="Generate progress report")
@@ -894,6 +1152,10 @@ def main():
     register_commands(sub)
 
     args = parser.parse_args()
+    if args.command == "restart":
+        args.task_file = args.task_file_opt or args.task_file_pos
+        if not args.task_file:
+            parser.error("restart requires a task file, e.g. aura restart tasks/task.md")
 
     # Apply --data-dir if passed via argparse (overrides early parse for edge cases)
     if args.data_dir:
@@ -905,6 +1167,7 @@ def main():
 
     cmds = {
         "start": cmd_start,
+        "restart": cmd_restart,
         "status": cmd_status,
         "progress": cmd_progress,
         "projects": cmd_projects,
@@ -914,7 +1177,7 @@ def main():
     }
     cmd = cmds.get(args.command)
     if cmd:
-        if args.command == "start":
+        if args.command in {"start", "restart"}:
             cmd(args)
         elif args.command == "cleanup":
             if args.force:

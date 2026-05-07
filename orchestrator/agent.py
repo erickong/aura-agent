@@ -119,9 +119,10 @@ Each wake cycle, follow this structure:
 
 ### 1. SITUATION ASSESSMENT
 - First use the current state snapshot supplied in the user message.
-- Only read .aura/state/progress.md, .aura/state/state.json, memory/session.md, or task directories when the snapshot lacks evidence needed for a decision.
+- Aura data is task-file scoped. If you must read files, use the explicit Aura data directory shown in the context or the provided workspace snapshot. Do not assume legacy `.aura/state` or `.aura/workspace` paths are authoritative.
 - For active tasks, prefer the included Phase 2 signals and workspace/output summaries before making extra tool calls.
-- If there are no active/running/pending tasks and no task-file change, call no_op without extra file reads.
+- If Planning needed is true, update the task tree from the task file before no_op or spawning work.
+- If there are no active/running/pending tasks, no task-file change, and Planning needed is false, call no_op without extra file reads.
 
 ### 2. PROGRESS EVALUATION
 For each active task, evaluate:
@@ -148,10 +149,13 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 ## Rules
 
 - Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
-- Requirements parsed from the user's task file appear as T1, T2, ... in the task tree. Do not ignore pending task-file requirements.
+- The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
+- During planning, first identify and persist project context with update_project_context: final goal, success criteria, global constraints, and execution environment such as commands, env vars/API key usage, models, and working directories.
+- During planning, do not inspect other task-file data directories under `.aura` for current state, progress, workspace outputs, summaries, caches, or task metadata. You may read other task directories' memory files only as lessons, not as evidence for the current task; record any borrowed lesson explicitly in current project context or memory.
+- New top-level tasks use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A tasks keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
 - Preserve and build on existing subtasks, evidence, and completed work. Do not re-plan from scratch just because the task file is broad or edited.
 - Treat completed tasks and result.md evidence as coverage for matching requirements; avoid repeating completed work unless the requirement text materially changed.
-- If the task file explicitly says earlier items are already done, focus on the true incremental requirements below that note.
+- Do not mark tasks completed from task-file wording alone. Completion requires verifiable evidence, worker artifacts, or an explicit user request.
 - If there is free Layer 2 capacity and multiple independent pending requirements exist, start work on up to 2 of them instead of focusing only on the first item.
 - If a task runs 12+ cycles with NO verifiable output → kill it or trigger replanning
 - If the entire project has no effective progress for several hours → comprehensive replanning
@@ -390,6 +394,9 @@ def build_context_message(
     last_decisions = decision_log[-5:] if decision_log else []
     status_counts = _collect_status_counts(state.get("tasks", []))
     pending_count = status_counts.get("pending", 0)
+    root_children = state.get("tasks", [{}])[0].get("children", []) if state.get("tasks") else []
+    task_file_changed = bool(wake_change and wake_change.get("changed"))
+    task_file_needs_planning = bool(state.get("task_file_needs_planning"))
     progress_preview = _read_text_preview(
         os.path.join(STATE_DIR, "progress.md"),
         max_chars=4500,
@@ -403,6 +410,15 @@ def build_context_message(
         active_tasks,
     )
     phase2_summary = _format_phase2_summary(p2_result)
+    project_context = state.get("project_context", {}) or {}
+    project_context_text = (
+        f"Final goal: {project_context.get('final_goal') or '(not set)'}\n"
+        f"Success criteria: {project_context.get('success_criteria') or '(not set)'}\n"
+        f"Global constraints: {project_context.get('global_constraints') or '(not set)'}\n"
+        f"Execution environment: {project_context.get('execution_environment') or '(not set)'}\n"
+        f"Notes: {project_context.get('notes') or '(not set)'}\n"
+        f"Updated: {project_context.get('updated_at') or '(never)'}"
+    )
 
     running_info = ""
     running_tasks = process_mgr.list_all()
@@ -421,11 +437,15 @@ def build_context_message(
     # ── Changelog info: 检测 task.md 文件是否有变更 ──
     changelog_info = ""
     task_file = state.get("task_file", "")
+    task_file_preview = "(no task file recorded)"
+    planning_needed = False
     if task_file:
         from .config import PROJECT_ROOT, PROJECTS_DIR
         task_file_path = os.path.join(PROJECT_ROOT, task_file)
         project_name = get_project_name_for_task(task_file)
         if os.path.exists(task_file_path):
+            task_file_preview = _read_text_preview(task_file_path, max_chars=5000)
+            planning_needed = (not root_children) or task_file_changed or task_file_needs_planning
             # ── R7: 优先使用 per-wake diff 信息（更详细）──────
             if wake_change and wake_change.get("changed"):
                 changelog_info = _format_wake_change_info(task_file, wake_change)
@@ -445,8 +465,24 @@ def build_context_message(
 ### Mission
 {state.get('mission', 'NOT SET')}
 
+### Project Context
+{project_context_text}
+
 ### Cycle
 Cycle #{state.get('total_cycles', 0)} | Created: {state.get('created_at', 'unknown')}
+
+### Aura Data Directory
+{os.path.dirname(STATE_DIR)}
+
+### Task File
+Path: {task_file or '(none)'}
+Changed this wake: {task_file_changed}
+Planning needed: {planning_needed}
+Current task batch prefix for new top-level tasks: {state.get('task_batch', {}).get('current_prefix', 'A')}
+
+```markdown
+{task_file_preview}
+```
 
 ### Task Tree
 {task_tree}
@@ -484,8 +520,12 @@ Cycle #{state.get('total_cycles', 0)} | Created: {state.get('created_at', 'unkno
 
 Now assess the situation and decide what to do.
 - Use the snapshot above as the default source of truth. Do not re-read progress.md, session.md, state.json, or task directories unless the snapshot is missing evidence needed for a state-changing decision.
+- Code does not parse task.md into semantic tasks. If Planning needed is True, read the task file content above, identify the final goal, success criteria, global constraints, and execution environment, then call update_project_context before decompose_task/update_task_tree/spawn_task.
+- When planning, do not read other `.aura/<task-data-dir>/state`, `workspace`, `progress`, `summaries`, `cache`, or task metadata as current evidence. Other `.aura/<task-data-dir>/memory/...` files may be used only for transferable lessons, and any borrowed lesson should be noted with its scope.
+- For a first plan, call decompose_task with parent_task_id="root" to create top-level tasks. For a changed task file, add only genuinely new/changed requirements under root, and explicitly archive obsolete non-completed tasks when appropriate. Do not mark tasks completed from task.md wording alone; completed requires verifiable evidence or an explicit user request.
+- Carry Project Context into every new task description, especially commands, env vars/API key usage, working directories, model/runtime choices, and success criteria.
 - If there are active tasks or running processes, evaluate them from the Phase 2 signals and workspace snapshot first; read only the specific missing file if needed.
-- If there are no active tasks, no running processes, no pending tasks (pending={pending_count}), and no task-file change, use no_op without extra file reads.
+- If there are no active tasks, no running processes, no pending tasks (pending={pending_count}), no task-file change, and Planning needed is False, use no_op without extra file reads.
 - Otherwise take action (spawn, kill, update, decompose, write_memory, or no_op) and record evidence for any status change."""
 
     # ── Phase 3: Review nudge injection ──────────────────────────
@@ -512,6 +552,22 @@ MAX_CONSECUTIVE_CRASHES = 3
 
 # ── Phase 3: Review nudge tracking ───────────────────────────────────
 _cycle_since_last_review: int = 0
+
+_STATE_CHANGING_TOOLS = {
+    "spawn_task",
+    "kill_task",
+    "update_task_tree",
+    "decompose_task",
+    "update_project_context",
+}
+
+
+def _render_progress_safely(reason: str = "") -> None:
+    try:
+        progress_mgr.render_progress()
+    except Exception as err:
+        suffix = f" after {reason}" if reason else ""
+        print(f"  [WARN] Could not render progress{suffix}: {err}")
 
 # ── T0 optimization: session write dedup ──────────────────────────────
 # session.md is written every cycle via _update_session(). Since the
@@ -721,7 +777,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 )
                 print(f"\n[Orchestrator] Decision complete: {final_text[:200]}...")
 
-                progress_mgr.render_progress()
+                _render_progress_safely("cycle completion")
 
                 # Update session memory
                 _update_session(cycle_num, tool_call_count, p2_result)
@@ -763,6 +819,8 @@ def run_cycle(wake_change: dict | None = None) -> dict:
 
                 result_str = execute_tool(tool_name, tool_input)
                 tool_call_count += 1
+                if tool_name in _STATE_CHANGING_TOOLS:
+                    _render_progress_safely(tool_name)
 
                 tool_results.append({
                     "type": "tool_result",
@@ -781,6 +839,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
         traceback.print_exc()
 
         _cycle_since_last_review += 1
+        _render_progress_safely("cycle error")
 
         elapsed = time.time() - cycle_start
         return {
