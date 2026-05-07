@@ -168,10 +168,36 @@ Important environment variables:
 | `AURA_CYCLE_INTERVAL` | `300` | Wake interval in seconds |
 | `AURA_DEEP_REVIEW_INTERVAL` | `12` | Review interval in cycles |
 | `AURA_MAX_TOKENS` | `4096` | Max output tokens per Layer 1 API call |
+| `AURA_MAX_CONCURRENT_TASKS` | `2` | Max concurrent Layer 2 workers |
 | `AURA_TASK_BUDGET` | `30` | Default Layer 2 worker budget in minutes |
 | `AURA_MAX_TURNS` | `50` | Max turns for Claude Code workers |
 | `AURA_DSCODE_MODEL` | `deepseek-v4-pro` | ds-code model when using `AURA_LAYER2_BACKEND=ds_code` |
+| `AURA_WORKER_RESOURCE_GUARD` | `1` | Enable worker resource preflight and watchdog checks |
+| `AURA_WORKER_RESOURCE_AVG_WINDOW_SECONDS` | `180` | Rolling window used before sustained resource violations count |
+| `AURA_WORKER_RESOURCE_VIOLATION_STRIKES` | `3` | Consecutive rolling-window violations before killing a worker |
+| `AURA_WORKER_MAX_CPU_PERCENT` | `80` | Per-worker CPU ceiling as percent of total system CPU; `0` disables |
+| `AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT` | `80` | Per-worker process-tree RSS ceiling as percent of total RAM; `0` disables |
+| `AURA_WORKER_MAX_GPU_UTIL_PERCENT` | `80` | Per-worker GPU utilization ceiling when per-process GPU utilization is available |
+| `AURA_WORKER_MAX_GPU_MEMORY_PERCENT` | `80` | Per-worker NVIDIA GPU memory ceiling as percent of visible GPU memory |
+| `AURA_WORKER_MAX_SYSTEM_MEMORY_GB` | `0` | Optional absolute per-worker process-tree RSS ceiling; `0` disables |
+| `AURA_WORKER_MIN_SYSTEM_MEMORY_FREE_GB` | `0` | Minimum free system memory reserve before/during worker execution |
+| `AURA_WORKER_MAX_GPU_MEMORY_GB` | `0` | Optional absolute per-worker NVIDIA GPU memory ceiling using `nvidia-smi`; `0` disables |
+| `AURA_WORKER_MIN_GPU_MEMORY_FREE_GB` | `0` | Minimum visible-GPU free-memory reserve before/during worker execution |
+| `AURA_WORKER_CUDA_VISIBLE_DEVICES` | empty | Optional `CUDA_VISIBLE_DEVICES` value injected into workers |
 | `AURA_FILE_CACHE` | `1` | Enable mtime-based file cache |
+
+For resource-heavy experiments, do not rely on prose constraints in the task file alone. Put the hard limits in config, for example:
+
+```bash
+AURA_MAX_CONCURRENT_TASKS=2
+AURA_WORKER_MAX_CPU_PERCENT=80
+AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT=80
+AURA_WORKER_MAX_GPU_UTIL_PERCENT=80
+AURA_WORKER_MAX_GPU_MEMORY_PERCENT=80
+AURA_WORKER_CUDA_VISIBLE_DEVICES=0
+```
+
+The watchdog samples only the Aura worker process tree, not unrelated programs. Sustained rolling-average violations kill the worker, return the original task to pending once for a smaller retry, then create a resource-fix subtask if the retry also exceeds limits. GPU checks require `nvidia-smi`; CPU affinity is applied when the platform supports it.
 
 ## CLI Reference
 

@@ -15,7 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1473,6 +1473,21 @@ class TestTools:
         result = impl_list_running_tasks()
         assert "No running tasks" in result
 
+    def test_process_identity_rejects_reused_pid(self):
+        from orchestrator import process_mgr
+
+        current = process_mgr.psutil.Process(os.getpid())
+        stale_started_at = datetime.fromtimestamp(current.create_time()) - timedelta(hours=1)
+        entry = {
+            "pid": os.getpid(),
+            "task_id": "A1.1",
+            "started_at": stale_started_at,
+            "killed_at": None,
+        }
+
+        assert process_mgr._is_alive(os.getpid())
+        assert not process_mgr._entry_process_is_alive(entry)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Progress & Memory Tests
@@ -1917,6 +1932,11 @@ class TestConfig:
         assert config.STUCK_THRESHOLD_CYCLES == 12
         assert config.API_RETRY_COUNT == 4
         assert config.CYCLE_INTERVAL_SECONDS >= 60
+        assert config.WORKER_RESOURCE_GUARD_ENABLED is True
+        assert config.WORKER_MAX_CPU_PERCENT == 80
+        assert config.WORKER_MAX_SYSTEM_MEMORY_PERCENT == 80
+        assert config.WORKER_MAX_GPU_MEMORY_PERCENT == 80
+        assert config.WORKER_MAX_GPU_UTIL_PERCENT == 80
 
     def test_env_override(self):
         import importlib
@@ -1926,3 +1946,48 @@ class TestConfig:
             # Reload config to pick up env changes
             cfg = importlib.reload(cfg)
             assert cfg.CYCLE_INTERVAL_SECONDS == 60
+
+
+class TestResourceGuard:
+    """Test worker resource guard helpers."""
+
+    def test_resource_violation_requires_two_strikes(self):
+        from orchestrator import process_mgr
+
+        limits = {
+            "enabled": True,
+            "poll_seconds": 10,
+            "avg_window_seconds": 180,
+            "violation_strikes": 1,
+            "max_cpu_percent": 0,
+            "max_system_memory_percent": 0,
+            "max_gpu_util_percent": 0,
+            "max_gpu_memory_percent": 0,
+            "max_system_memory_gb": 1,
+            "min_system_memory_free_gb": 0,
+            "max_gpu_memory_gb": 0,
+            "min_gpu_memory_free_gb": 0,
+            "cuda_visible_devices": "",
+        }
+        entry = {"resource_limits": limits}
+        metrics = {
+            "cpu_percent": 0,
+            "memory_mb": 2048,
+            "memory_percent": 1,
+            "gpu_memory_mb": None,
+            "gpu_memory_percent": None,
+            "gpu_util_percent": None,
+        }
+
+        assert process_mgr._evaluate_resource_violation(entry, metrics) is None
+        reason = process_mgr._evaluate_resource_violation(entry, metrics)
+        assert "host RSS" in reason
+
+    def test_worker_env_exports_resource_policy(self):
+        from orchestrator import process_mgr
+
+        env = process_mgr._worker_env({})
+        assert env["AURA_WORKER_RESOURCE_GUARD"] in {"0", "1"}
+        assert env["AURA_WORKER_FORBID_OFFLOAD"] == "1"
+        assert env["TF_FORCE_GPU_ALLOW_GROWTH"] == "true"
+        assert "AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT" in env

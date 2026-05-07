@@ -73,6 +73,8 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 ## Rules
 
 - Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
+- If a task returns to pending after the resource guard killed it once, retry it only with a smaller/safer plan: reduce batch size, epochs, model size, data subset, workers, or disable offload.
+- If a task is blocked because the resource guard killed it twice, prefer the generated resource-fix subtask. Use its result to continue the original goal if feasible. If the requirement is plainly impossible on the available hardware, record that with concrete evidence instead of retrying forever.
 - The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
 - During planning, first identify and persist project context with update_project_context: final goal, success criteria, global constraints, and execution environment such as commands, env vars/API key usage, models, and working directories.
 - During planning, do not inspect other task-file data directories under `.aura` for current state, progress, workspace outputs, summaries, caches, or task metadata. You may read other task directories' memory files only as lessons, not as evidence for the current task; record any borrowed lesson explicitly in current project context or memory.

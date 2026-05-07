@@ -1,5 +1,19 @@
 import os
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return float(value)
+
 CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.environ.get("AURA_PROJECT_ROOT", os.getcwd()))
 _data_dir = os.environ.get("AURA_DATA_DIR", os.path.join(PROJECT_ROOT, ".aura"))
@@ -38,9 +52,23 @@ CYCLE_INTERVAL_SECONDS = int(os.environ.get("AURA_CYCLE_INTERVAL", "300"))
 DEEP_REVIEW_INTERVAL_CYCLES = int(os.environ.get("AURA_DEEP_REVIEW_INTERVAL", "12"))
 LLM_DEAD_THROTTLE_SECONDS = int(os.environ.get("AURA_LLM_DEAD_THROTTLE", "300"))
 
-MAX_CONCURRENT_TASKS = 2
+MAX_CONCURRENT_TASKS = int(os.environ.get("AURA_MAX_CONCURRENT_TASKS", "2"))
 DEFAULT_TASK_BUDGET_MINUTES = int(os.environ.get("AURA_TASK_BUDGET", "30"))
 DEFAULT_MAX_TURNS = int(os.environ.get("AURA_MAX_TURNS", "50"))
+
+WORKER_RESOURCE_GUARD_ENABLED = _env_bool("AURA_WORKER_RESOURCE_GUARD", True)
+WORKER_RESOURCE_POLL_SECONDS = int(os.environ.get("AURA_WORKER_RESOURCE_POLL_SECONDS", "10"))
+WORKER_RESOURCE_AVG_WINDOW_SECONDS = int(os.environ.get("AURA_WORKER_RESOURCE_AVG_WINDOW_SECONDS", "180"))
+WORKER_RESOURCE_VIOLATION_STRIKES = int(os.environ.get("AURA_WORKER_RESOURCE_VIOLATION_STRIKES", "3"))
+WORKER_MAX_CPU_PERCENT = _env_float("AURA_WORKER_MAX_CPU_PERCENT", 80.0)
+WORKER_MAX_SYSTEM_MEMORY_PERCENT = _env_float("AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT", 80.0)
+WORKER_MAX_GPU_UTIL_PERCENT = _env_float("AURA_WORKER_MAX_GPU_UTIL_PERCENT", 80.0)
+WORKER_MAX_GPU_MEMORY_PERCENT = _env_float("AURA_WORKER_MAX_GPU_MEMORY_PERCENT", 80.0)
+WORKER_MAX_SYSTEM_MEMORY_GB = _env_float("AURA_WORKER_MAX_SYSTEM_MEMORY_GB", 0.0)
+WORKER_MIN_SYSTEM_MEMORY_FREE_GB = _env_float("AURA_WORKER_MIN_SYSTEM_MEMORY_FREE_GB", 0.0)
+WORKER_MAX_GPU_MEMORY_GB = _env_float("AURA_WORKER_MAX_GPU_MEMORY_GB", 0.0)
+WORKER_MIN_GPU_MEMORY_FREE_GB = _env_float("AURA_WORKER_MIN_GPU_MEMORY_FREE_GB", 0.0)
+WORKER_CUDA_VISIBLE_DEVICES = os.environ.get("AURA_WORKER_CUDA_VISIBLE_DEVICES", "").strip()
 
 AURA_LAYER2_BACKEND = os.environ.get("AURA_LAYER2_BACKEND", "claude_code")
 

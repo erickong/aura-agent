@@ -72,6 +72,31 @@ Expected outputs:
 
 The default maximum concurrency is 2 workers.
 
+Worker resource limits are enforced in `process_mgr.py`, not by trusting task
+text. The resource guard can:
+
+- block spawning when configured system/GPU free-memory reserves are not met
+- inject `CUDA_VISIBLE_DEVICES` and framework-friendly allocation environment
+  variables into worker processes
+- apply CPU affinity when a total-system CPU ceiling is configured and the
+  platform supports affinity
+- poll only the Aura worker process tree for CPU, RSS, NVIDIA GPU memory, and
+  best-effort per-process GPU utilization
+- use rolling averages over the recent window so short peaks do not trigger
+  unnecessary kills
+- kill workers after repeated sustained resource violations and wake the
+  orchestrator
+- return the original task to `pending` once for a smaller retry; if it exceeds
+  limits again, mark it `blocked` and create/spawn a resource-fix subtask
+
+Key controls are `AURA_MAX_CONCURRENT_TASKS`,
+`AURA_WORKER_MAX_CPU_PERCENT`, `AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT`,
+`AURA_WORKER_MAX_GPU_UTIL_PERCENT`, `AURA_WORKER_MAX_GPU_MEMORY_PERCENT`,
+`AURA_WORKER_RESOURCE_AVG_WINDOW_SECONDS`,
+`AURA_WORKER_RESOURCE_VIOLATION_STRIKES`, and
+`AURA_WORKER_CUDA_VISIBLE_DEVICES`. Optional absolute GB reserve/ceiling
+controls are still available for machines that need them.
+
 ## State
 
 State lives under `.aura/state/`.

@@ -472,6 +472,9 @@ current-task evidence.
 - Current working directory: {task_dir}
 - This current directory is the task output directory. Put all outputs here.
 
+## Hard Resource Policy
+{process_mgr.resource_policy_text()}
+
 ## Progress Tracking (output.jsonl)
 - The orchestrator monitors your output.jsonl for progress detection.
 - This file is automatically written by the CLI with --output-format=stream-json.
@@ -492,6 +495,8 @@ current-task evidence.
         f.write(task_content)
 
     spawn_result = process_mgr.spawn(task_id, task_dir, task_md_path, budget_minutes)
+    if not spawn_result.startswith("OK:"):
+        return spawn_result
 
     # ── Auto-sync task tree: mark as in_progress ───────────────────
     # The LLM no longer needs to call update_task_tree separately;
@@ -525,10 +530,19 @@ def impl_list_running_tasks() -> str:
         return "No running tasks."
     lines = [f"Running tasks ({len(tasks)}):"]
     for t in tasks:
+        gpu = "n/a" if t.get("gpu_memory_mb") is None else f"{t['gpu_memory_mb']}MB"
+        gpu_avg = "n/a" if t.get("avg_gpu_memory_percent") is None else f"{t['avg_gpu_memory_percent']}%"
+        gpu_util = "n/a" if t.get("avg_gpu_util_percent") is None else f"{t['avg_gpu_util_percent']}%"
+        violation = f" | Resource violation: {t['resource_violation']}" if t.get("resource_violation") else ""
         lines.append(f"  {t['task_id']} | PID: {t['pid']} | "
                       f"Running: {t['running']} | "
                       f"Elapsed: {t['elapsed_minutes']}min | "
-                      f"Output size: {t['output_size']} bytes")
+                      f"CPU avg/current: {t.get('avg_cpu_percent', 0)}%/{t.get('cpu_percent', 0)}% | "
+                      f"RAM avg/current: {t.get('avg_memory_percent', 0)}%/{t.get('memory_percent', 0)}% | "
+                      f"GPU mem avg/current: {gpu_avg}/{gpu} | "
+                      f"GPU util avg: {gpu_util} | "
+                      f"Output size: {t['output_size']} bytes"
+                      f"{violation}")
     return "\n".join(lines)
 
 
