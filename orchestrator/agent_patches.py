@@ -70,6 +70,14 @@ Use your tools to implement your decisions. Don't just think — act.
 ### 5. RECORD
 Update the task tree, write important learnings to memory. Keep the progress report current.
 
+## Task Hierarchy Rules
+
+- The task tree must be hierarchical. Do not flatten concrete work directly under ROOT.
+- ROOT represents the final goal. ROOT children such as A1, A2, B1 are broad planning categories or major steps, not worker-executable tasks.
+- Concrete worker tasks must live at ROOT -> category -> task level or deeper, for example A1.1, A1.2, B2.1. Even if a category has only one concrete task, create that third-level node.
+- Before spawning work, decompose the relevant top-level category into third-level tasks. Use fourth-level tasks only when a third-level task truly needs another split.
+- When creating or spawning a third-level task, include sibling context: what sibling tasks tried, their evidence, and whether they succeeded, failed, were killed, or remain pending.
+
 ## Rules
 
 - Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
@@ -78,7 +86,7 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 - The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
 - During planning, first identify and persist project context with update_project_context: final goal, success criteria, global constraints, and execution environment such as commands, env vars/API key usage, models, and working directories.
 - During planning, do not inspect other task-file data directories under `.aura` for current state, progress, workspace outputs, summaries, caches, or task metadata. You may read other task directories' memory files only as lessons, not as evidence for the current task; record any borrowed lesson explicitly in current project context or memory.
-- New top-level tasks use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A tasks keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
+- New top-level categories use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A categories keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
 - Preserve and build on existing subtasks, evidence, and completed work. Do not re-plan from scratch just because the task file is broad or edited.
 - Treat completed tasks and result.md evidence as coverage for matching requirements; avoid repeating completed work unless the requirement text materially changed.
 - Do not mark tasks completed from task-file wording alone. Completion requires verifiable evidence, worker artifacts, or an explicit user request.

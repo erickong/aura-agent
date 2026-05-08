@@ -146,6 +146,14 @@ Use your tools to implement your decisions. Don't just think — act.
 ### 5. RECORD
 Update the task tree, write important learnings to memory. Keep the progress report current.
 
+## Task Hierarchy Rules
+
+- The task tree must be hierarchical. Do not flatten concrete work directly under ROOT.
+- ROOT represents the final goal. ROOT children such as A1, A2, B1 are broad planning categories or major steps, not worker-executable tasks.
+- Concrete worker tasks must live at ROOT -> category -> task level or deeper, for example A1.1, A1.2, B2.1. Even if a category has only one concrete task, create that third-level node.
+- Before spawning work, decompose the relevant top-level category into third-level tasks. Use fourth-level tasks only when a third-level task truly needs another split.
+- When creating or spawning a third-level task, include sibling context: what sibling tasks tried, their evidence, and whether they succeeded, failed, were killed, or remain pending.
+
 ## Rules
 
 - Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
@@ -154,7 +162,7 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 - The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
 - During planning, first identify and persist project context with update_project_context: final goal, success criteria, global constraints, and execution environment such as commands, env vars/API key usage, models, and working directories.
 - During planning, do not inspect other task-file data directories under `.aura` for current state, progress, workspace outputs, summaries, caches, or task metadata. You may read other task directories' memory files only as lessons, not as evidence for the current task; record any borrowed lesson explicitly in current project context or memory.
-- New top-level tasks use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A tasks keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
+- New top-level categories use the current batch prefix shown in context, such as A1, A2, ...; after the task file changes, newly added top-level requirements use the next prefix such as B1, B2, ... Existing A categories keep their IDs and children of A tasks must continue as A1.1, A1.2, etc.
 - Preserve and build on existing subtasks, evidence, and completed work. Do not re-plan from scratch just because the task file is broad or edited.
 - Treat completed tasks and result.md evidence as coverage for matching requirements; avoid repeating completed work unless the requirement text materially changed.
 - Do not mark tasks completed from task-file wording alone. Completion requires verifiable evidence, worker artifacts, or an explicit user request.
@@ -480,7 +488,7 @@ Cycle #{state.get('total_cycles', 0)} | Created: {state.get('created_at', 'unkno
 Path: {task_file or '(none)'}
 Changed this wake: {task_file_changed}
 Planning needed: {planning_needed}
-Current task batch prefix for new top-level tasks: {state.get('task_batch', {}).get('current_prefix', 'A')}
+Current task batch prefix for new top-level categories: {state.get('task_batch', {}).get('current_prefix', 'A')}
 
 ```markdown
 {task_file_preview}
@@ -524,7 +532,9 @@ Now assess the situation and decide what to do.
 - Use the snapshot above as the default source of truth. Do not re-read progress.md, session.md, state.json, or task directories unless the snapshot is missing evidence needed for a state-changing decision.
 - Code does not parse task.md into semantic tasks. If Planning needed is True, read the task file content above, identify the final goal, success criteria, global constraints, and execution environment, then call update_project_context before decompose_task/update_task_tree/spawn_task.
 - When planning, do not read other `.aura/<task-data-dir>/state`, `workspace`, `progress`, `summaries`, `cache`, or task metadata as current evidence. Other `.aura/<task-data-dir>/memory/...` files may be used only for transferable lessons, and any borrowed lesson should be noted with its scope.
-- For a first plan, call decompose_task with parent_task_id="root" to create top-level tasks. For a changed task file, add only genuinely new/changed requirements under root, and explicitly archive obsolete non-completed tasks when appropriate. Do not mark tasks completed from task.md wording alone; completed requires verifiable evidence or an explicit user request.
+- For a first plan, call decompose_task with parent_task_id="root" to create broad top-level categories, then decompose each category into concrete third-level tasks such as A1.1 before spawning work. For a changed task file, add only genuinely new/changed categories or concrete children as appropriate, and explicitly archive obsolete non-completed tasks when appropriate. Do not mark tasks completed from task.md wording alone; completed requires verifiable evidence or an explicit user request.
+- Never spawn root or top-level category nodes such as A1/B1. Every worker-executable task must be at ROOT -> category -> task level or deeper, even when a category has only one concrete child.
+- When planning or spawning a concrete task, preserve sibling awareness: summarize sibling tasks under the same parent, their attempted approach, evidence, and success/failure/pending outcome.
 - Carry Project Context into every new task description, especially commands, env vars/API key usage, working directories, model/runtime choices, and success criteria.
 - If there are active tasks or running processes, evaluate them from the Phase 2 signals and workspace snapshot first; read only the specific missing file if needed.
 - If there are no active tasks, no running processes, no pending tasks (pending={pending_count}), no task-file change, and Planning needed is False, use no_op without extra file reads.

@@ -572,6 +572,19 @@ def _is_task_file_node(task: dict, task_file: str) -> bool:
     return bool(re.fullmatch(r"[A-Z]+\d+", str(task.get("id", "")))) and task.get("depth", 1) == 1
 
 
+def _has_top_level_category_without_children(state: dict) -> bool:
+    """Return True while ROOT children still need concrete task children."""
+    if not state.get("tasks"):
+        return False
+    root = state["tasks"][0]
+    for child in root.get("children", []):
+        if child.get("status") in {"archived", "killed"}:
+            continue
+        if not child.get("children"):
+            return True
+    return False
+
+
 def reconcile_task_file(
     task_file: str,
     mission: str = "",
@@ -636,7 +649,12 @@ def reconcile_task_file(
             stats["interrupted"] += 1
 
     root_children = root.get("children", [])
-    if task_file_changed or not root_children or stats["reopened_auto_completed"] > 0:
+    if (
+        task_file_changed
+        or not root_children
+        or stats["reopened_auto_completed"] > 0
+        or _has_top_level_category_without_children(state)
+    ):
         state["task_file_needs_planning"] = True
     stats["planning_needed"] = bool(state.get("task_file_needs_planning"))
 
@@ -764,14 +782,13 @@ def decompose_task(parent_task_id: str, subtasks: list[dict]) -> str:
         st["id"] = proposed_id
         existing_ids.add(proposed_id)
         st.setdefault("status", "pending")
-        st.setdefault("depth", new_depth)
+        st["depth"] = new_depth
         st.setdefault("created_at", datetime.now().isoformat())
         st.setdefault("attempts", 0)
         st.setdefault("children", [])
 
     parent.setdefault("children", []).extend(subtasks)
-    if parent.get("id") == "root":
-        state["task_file_needs_planning"] = False
+    state["task_file_needs_planning"] = _has_top_level_category_without_children(state)
     save_state(state)
 
     subtask_ids = [st["id"] for st in subtasks]

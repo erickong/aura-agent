@@ -18,6 +18,8 @@ from . import memory as memory_mgr
 from .config import get_workspace_dir
 from .file_cache import cached_read_file, cached_list_directory, invalidate_cache
 
+MIN_EXECUTABLE_TASK_DEPTH = 2
+
 # ── Tool Definitions (Anthropic schema) ──────────────────────────────
 
 TOOL_DEFINITIONS = [
@@ -88,13 +90,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "spawn_task",
-        "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a specific task. Maximum 2 concurrent workers. The worker will work on the task autonomously.",
+        "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. Maximum 2 concurrent workers. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Unique task ID from the current task tree, e.g. 'A1', 'A1.1', or 'B2'."
+                    "description": "Unique executable task ID from the current task tree, e.g. 'A1.1' or 'B2.3'. Do not spawn root or top-level category IDs like 'A1'."
                 },
                 "description": {
                     "type": "string",
@@ -161,7 +163,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "decompose_task",
-        "description": "Break a task into smaller subtasks. Use parent_task_id='root' to create or extend the top-level plan from task.md. Each subtask should have clear, verifiable acceptance criteria.",
+        "description": "Break a task into smaller subtasks. Use parent_task_id='root' only to create broad planning categories. Then decompose each category into concrete third-level tasks (for example A1 -> A1.1) before spawning workers. Each concrete task should have clear, verifiable acceptance criteria.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -390,6 +392,137 @@ def impl_list_directory(path: str) -> str:
         return f"ERROR listing directory: {e}"
 
 
+def _find_task_context(task_id: str, tasks: list[dict], parent: dict | None = None,
+                       path: list[dict] | None = None) -> tuple[dict | None, dict | None, list[dict]]:
+    """Return the task, its parent, and the root-to-task path."""
+    path = path or []
+    for task in tasks:
+        current_path = [*path, task]
+        if task.get("id") == task_id:
+            return task, parent, current_path
+        found, found_parent, found_path = _find_task_context(
+            task_id, task.get("children", []), task, current_path
+        )
+        if found:
+            return found, found_parent, found_path
+    return None, None, []
+
+
+def _short_task_text(text: str, limit: int = 260) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3] + "..."
+
+
+def _latest_decision_for(state: dict, task_id: str) -> dict | None:
+    for decision in reversed(state.get("decision_log", [])):
+        if decision.get("task_id") == task_id:
+            return decision
+    return None
+
+
+def _read_task_result_preview(task_id: str, max_chars: int = 900) -> str:
+    result_path = os.path.join(get_workspace_dir(), "tasks", task_id, "result.md")
+    if not os.path.exists(result_path):
+        return ""
+    try:
+        with open(result_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(max_chars + 1)
+    except OSError:
+        return ""
+    content = content.strip()
+    if len(content) > max_chars:
+        content = content[:max_chars].rstrip() + "\n... [truncated]"
+    return content
+
+
+def _format_task_hierarchy_context(task_id: str, state: dict) -> str:
+    task, parent, path = _find_task_context(task_id, state.get("tasks", []))
+    if not task:
+        return "(task context unavailable)"
+
+    path_text = " -> ".join(
+        f"{node.get('id')}: {_short_task_text(node.get('description', ''), 90)}"
+        for node in path
+    )
+    parent_text = "(none)"
+    if parent:
+        parent_text = (
+            f"{parent.get('id')}: "
+            f"{_short_task_text(parent.get('description', ''), 220)}"
+        )
+
+    return "\n".join([
+        f"- Path: {path_text}",
+        f"- Parent category: {parent_text}",
+        (
+            "- Executable task level: this worker is assigned at "
+            "ROOT -> category -> task level or deeper."
+        ),
+    ])
+
+
+def _format_sibling_context(task_id: str, state: dict) -> str:
+    task, parent, _path = _find_task_context(task_id, state.get("tasks", []))
+    if not task:
+        return "(task context unavailable)"
+    if not parent:
+        return "This task has no parent category in the current tree."
+
+    peers = parent.get("children", [])
+    if not peers:
+        return "No peer tasks are recorded under this parent category."
+
+    lines = [
+        (
+            "Use these peer outcomes when planning so you do not repeat failed "
+            "attempts and can build on useful evidence."
+        )
+    ]
+    for peer in peers[:12]:
+        peer_id = str(peer.get("id", "?"))
+        label = " (current task)" if peer_id == task_id else ""
+        lines.append(
+            f"- {peer_id}{label} [{peer.get('status', 'pending')}]: "
+            f"{_short_task_text(peer.get('description', ''), 240)}"
+        )
+        acceptance = peer.get("acceptance_criteria")
+        if acceptance:
+            lines.append(f"  Acceptance: {_short_task_text(acceptance, 220)}")
+
+        decision = _latest_decision_for(state, peer_id)
+        if decision:
+            lines.append(
+                "  Latest decision: {old} -> {new}; reason: {reason}; evidence: {evidence}".format(
+                    old=decision.get("old_status", "?"),
+                    new=decision.get("new_status", "?"),
+                    reason=_short_task_text(decision.get("reason", ""), 180),
+                    evidence=_short_task_text(decision.get("evidence", ""), 180),
+                )
+            )
+        elif peer.get("evidence") or peer.get("reason"):
+            lines.append(
+                "  Recorded outcome: reason={reason}; evidence={evidence}".format(
+                    reason=_short_task_text(peer.get("reason", ""), 180),
+                    evidence=_short_task_text(peer.get("evidence", ""), 180),
+                )
+            )
+        else:
+            lines.append("  Recorded outcome: not executed yet.")
+
+        result_preview = _read_task_result_preview(peer_id)
+        if result_preview:
+            lines.append("  result.md preview:")
+            lines.append("  ```markdown")
+            lines.extend(f"  {line}" for line in result_preview.splitlines())
+            lines.append("  ```")
+
+    if len(peers) > 12:
+        lines.append(f"- ... {len(peers) - 12} more peer task(s) omitted.")
+    return "\n".join(lines)
+
+
 def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) -> str:
     """Spawn a Layer 2 Claude Code worker."""
     from .config import DEFAULT_MAX_TURNS, MAX_CONCURRENT_TASKS
@@ -400,6 +533,13 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
         return (
             f"ERROR: Task {task_id} not found in the current task tree. "
             "Use only task IDs shown in the current state snapshot."
+        )
+    if int(task.get("depth", 0)) < MIN_EXECUTABLE_TASK_DEPTH:
+        return (
+            f"ERROR: Task {task_id} is a planning/category node at depth "
+            f"{task.get('depth', 0)}. Workers may only be spawned for concrete "
+            "tasks at ROOT -> category -> task level or deeper, such as A1.1. "
+            f"First decompose {task_id} into child tasks."
         )
     if task.get("status") in {"completed", "archived"}:
         return f"ERROR: Task {task_id} is {task.get('status')} and cannot be spawned."
@@ -412,6 +552,8 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
         f"- Execution environment: {project_context.get('execution_environment') or '(not set)'}",
         f"- Notes: {project_context.get('notes') or '(not set)'}",
     ])
+    hierarchy_context_text = _format_task_hierarchy_context(task_id, state)
+    sibling_context_text = _format_sibling_context(task_id, state)
 
     # ── Guard: check actual running worker count ─────────────────────
     running = [w for w in process_mgr.list_all() if w.get("running")]
@@ -433,24 +575,7 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
     # By always writing fresh content here, we ensure the worker always
     # receives the orchestrator's INTENDED task, not leftover garbage.
     task_md_path = os.path.join(task_dir, "task.md")
-    task_content = f"""# Aura Agent — Guiding Philosophy
-
-In an uncertain, complex world, you approach truth through evidence and reasoning,
-understand causality through systems thinking, constrain capability with human values,
-and correct yourself through continuous feedback.
-
-Specifically:
-1. Don't attribute outcomes to a single cause — seek multi-variable, multi-level, multi-feedback explanations
-2. Don't pursue a one-shot ultimate answer — continuously reduce error rates
-3. Every conclusion must be testable, falsifiable, and have clear assumption boundaries
-4. Distinguish fact, inference, opinion, and speculation — be honest about uncertainty
-5. A viewpoint's value lies in how it changes decisions, not how sophisticated it sounds
-6. Continuously verify, continuously correct, continuously act — don't believe in grand narratives
-7. Humbly seek truth, systematically think, cautiously act
-
----
-
-# Task {task_id}
+    task_content = f"""# Task {task_id}
 
 {description}
 
@@ -460,6 +585,17 @@ Specifically:
 Project Context is background and constraints only. Your assigned work is the
 specific Task {task_id} above. Do not attempt the whole final goal unless this
 task explicitly asks you to do so.
+
+## Task Hierarchy
+{hierarchy_context_text}
+
+Tasks are intentionally hierarchical: ROOT is the final goal, ROOT children
+are broad planning categories, and concrete worker tasks live under those
+categories. Treat sibling task outcomes as shared local context for this
+category.
+
+## Sibling Tasks Context
+{sibling_context_text}
 
 Do not inspect other task-file data directories under `.aura` for state,
 progress, workspace outputs, summaries, caches, or task metadata. Other task
@@ -557,6 +693,12 @@ def impl_update_task_tree(task_id: str, new_status: str, reason: str, evidence: 
         state = state_mgr.load_state()
         existing = state_mgr.find_task(task_id, state["tasks"])
         already_in_progress = existing and existing.get("status") == "in_progress"
+        if existing and not already_in_progress and int(existing.get("depth", 0)) < MIN_EXECUTABLE_TASK_DEPTH:
+            return (
+                f"ERROR: Cannot mark {task_id} as in_progress because it is a "
+                "planning/category node. Decompose it into ROOT -> category -> "
+                "task level first, then spawn or start a concrete child such as A1.1."
+            )
         if not already_in_progress and currently_active >= MAX_CONCURRENT_TASKS:
             return (
                 f"ERROR: Cannot mark {task_id} as in_progress — already at max "

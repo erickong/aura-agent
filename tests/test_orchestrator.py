@@ -1134,7 +1134,7 @@ class TestDynamicPlanning:
         ])
         assert "A1.1" in result
 
-    def test_decompose_root_clears_planning_flag(
+    def test_decompose_category_clears_planning_flag(
         self, task_file_simple, patched_config, reset_state_cache
     ):
         from orchestrator import state as state_mgr
@@ -1146,9 +1146,16 @@ class TestDynamicPlanning:
         state["task_file_needs_planning"] = True
         state_mgr.save_state(state)
 
-        # Decomposing root should clear it
+        # Decomposing root creates categories only, so planning remains needed
+        # until each category has at least one concrete child task.
         state_mgr.decompose_task("root", [
-            {"id": "A1", "description": "Task", "acceptance_criteria": "Done"},
+            {"id": "A1", "description": "Category", "acceptance_criteria": "Done"},
+        ])
+        state = state_mgr.load_state()
+        assert state.get("task_file_needs_planning") is True
+
+        state_mgr.decompose_task("A1", [
+            {"id": "A1.1", "description": "Concrete task", "acceptance_criteria": "Done"},
         ])
 
         state = state_mgr.load_state()
@@ -1241,11 +1248,20 @@ class TestDynamicPlanning:
             {"id": "A2", "description": "T2", "acceptance_criteria": "Done"},
             {"id": "A3", "description": "T3", "acceptance_criteria": "Done"},
         ])
+        state_mgr.decompose_task("A1", [
+            {"id": "A1.1", "description": "T1 concrete", "acceptance_criteria": "Done"},
+        ])
+        state_mgr.decompose_task("A2", [
+            {"id": "A2.1", "description": "T2 concrete", "acceptance_criteria": "Done"},
+        ])
+        state_mgr.decompose_task("A3", [
+            {"id": "A3.1", "description": "T3 concrete", "acceptance_criteria": "Done"},
+        ])
 
         assert state_mgr.can_spawn_task() is True
 
-        state_mgr.update_task("A1", "in_progress", "Start", "manual")
-        state_mgr.update_task("A2", "in_progress", "Start", "manual")
+        state_mgr.update_task("A1.1", "in_progress", "Start", "manual")
+        state_mgr.update_task("A2.1", "in_progress", "Start", "manual")
 
         assert state_mgr.can_spawn_task() is False  # Max 2 concurrent
 
@@ -1403,13 +1419,22 @@ class TestTools:
             {"id": "A2", "description": "T2", "acceptance_criteria": "Done"},
             {"id": "A3", "description": "T3", "acceptance_criteria": "Done"},
         ])
+        state_mgr.decompose_task("A1", [
+            {"id": "A1.1", "description": "T1 concrete", "acceptance_criteria": "Done"},
+        ])
+        state_mgr.decompose_task("A2", [
+            {"id": "A2.1", "description": "T2 concrete", "acceptance_criteria": "Done"},
+        ])
+        state_mgr.decompose_task("A3", [
+            {"id": "A3.1", "description": "T3 concrete", "acceptance_criteria": "Done"},
+        ])
 
         # Put two tasks in_progress
-        state_mgr.update_task("A1", "in_progress", "Start", "manual")
-        state_mgr.update_task("A2", "in_progress", "Start", "manual")
+        state_mgr.update_task("A1.1", "in_progress", "Start", "manual")
+        state_mgr.update_task("A2.1", "in_progress", "Start", "manual")
 
         # Try to mark A3 as in_progress via update_task_tree → should be rejected
-        result = impl_update_task_tree("A3", "in_progress", "Trying",
+        result = impl_update_task_tree("A3.1", "in_progress", "Trying",
                                         "should fail")
         assert "ERROR" in result
         assert "max concurrent" in result.lower()
@@ -1450,6 +1475,65 @@ class TestTools:
         # Should say error from process_mgr but still update tree status
         assert "killed" in state_mgr.load_state()["tasks"][0]["children"][0]["status"] or \
                "ERROR" in result
+
+    def test_spawn_task_rejects_top_level_category(
+        self, task_file_simple, patched_config, reset_state_cache
+    ):
+        from orchestrator import state as state_mgr
+        from orchestrator.tools import impl_spawn_task
+
+        state_mgr.init_state("Test", str(task_file_simple))
+        state_mgr.decompose_task("root", [
+            {"id": "A1", "description": "Planning category", "acceptance_criteria": "Done"},
+        ])
+
+        result = impl_spawn_task("A1", "Do the work", budget_minutes=1)
+        assert "ERROR" in result
+        assert "planning/category" in result
+        assert "A1.1" in result
+
+    def test_spawn_task_writes_hierarchy_and_sibling_context(
+        self, task_file_simple, patched_config, reset_state_cache, monkeypatch
+    ):
+        from orchestrator import process_mgr
+        from orchestrator import state as state_mgr
+        from orchestrator.config import get_workspace_dir
+        from orchestrator.tools import impl_spawn_task
+
+        state_mgr.init_state("Test", str(task_file_simple))
+        state_mgr.decompose_task("root", [
+            {"id": "A1", "description": "Implementation category", "acceptance_criteria": "Done"},
+        ])
+        state_mgr.decompose_task("A1", [
+            {"id": "A1.1", "description": "Current concrete task", "acceptance_criteria": "Result exists"},
+            {"id": "A1.2", "description": "Sibling experiment", "acceptance_criteria": "Result exists"},
+        ])
+        state_mgr.update_task("A1.2", "failed", "Tried incompatible approach", "sibling failure evidence")
+
+        sibling_dir = Path(get_workspace_dir()) / "tasks" / "A1.2"
+        sibling_dir.mkdir(parents=True, exist_ok=True)
+        (sibling_dir / "result.md").write_text("Sibling result summary", encoding="utf-8")
+
+        monkeypatch.setattr(process_mgr, "list_all", lambda: [])
+        monkeypatch.setattr(
+            process_mgr,
+            "spawn",
+            lambda task_id, task_dir, task_md_path, budget_minutes: "OK: spawned",
+        )
+
+        result = impl_spawn_task("A1.1", "Execute current task", budget_minutes=1)
+        assert "OK" in result
+
+        task_md = Path(get_workspace_dir()) / "tasks" / "A1.1" / "task.md"
+        content = task_md.read_text(encoding="utf-8")
+        assert "Guiding Philosophy" not in content
+        assert content.startswith("# Task A1.1")
+        assert "## Task Hierarchy" in content
+        assert "## Sibling Tasks Context" in content
+        assert "A1.1 (current task)" in content
+        assert "A1.2 [failed]" in content
+        assert "sibling failure evidence" in content
+        assert "Sibling result summary" in content
 
     def test_tool_dispatch(self):
         from orchestrator.tools import execute_tool

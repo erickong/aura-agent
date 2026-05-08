@@ -829,6 +829,8 @@ def cmd_start(args):
 
     while _running:
         try:
+            worker_status_changed = False
+
             # R7: Check whether the task file changed on each wake.
             wake_change = check_task_file_on_wake(
                 task_file_path, PROJECTS_DIR, project_name
@@ -891,7 +893,6 @@ def cmd_start(args):
 
             # -- Layer 2 crash detection --
             tracked = process_mgr.list_all()
-            worker_status_changed = False
             for worker in tracked:
                 if not worker["running"]:
                     task_id = worker["task_id"]
@@ -1005,6 +1006,10 @@ def cmd_start(args):
             _save_project(project_name)
         except Exception as save_err:
             print(f"  [WARN] Project save failed (will retry next cycle): {save_err}")
+
+        if worker_status_changed:
+            print("[Watchdog] Worker status changed; starting next cycle immediately.")
+            continue
 
         _sleep_until_next_wake(interval)
 

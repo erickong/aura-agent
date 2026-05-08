@@ -21,7 +21,7 @@ def generate_task_summary(task_id: str, status: str, reason: str = "",
     """Generate a completion summary report for a finished task.
 
     Args:
-        task_id: The task ID (e.g. 'A1', 'A1.1', 'B2').
+        task_id: The task ID (e.g. 'A1.1', 'A1.2', 'B2.1').
         status: Final status ('completed', 'failed', 'killed', 'archived').
         reason: Why the task ended.
         evidence: Verifiable evidence (file paths, test results).
