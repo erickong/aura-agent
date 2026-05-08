@@ -972,10 +972,6 @@ def cmd_start(args):
 
             # -- Status line --
             status_parts = [f"Cycle #{cycle_count}"]
-            if result.get("skipped_api"):
-                status_parts.append("0 api calls")
-            elif "api_calls" in result:
-                status_parts.append(f"{result['api_calls']} api calls")
             if result.get("tool_calls", 0) > 0:
                 status_parts.append(f"{result['tool_calls']} tool calls")
             if result.get("activity_mode"):

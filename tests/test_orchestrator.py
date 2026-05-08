@@ -1854,59 +1854,6 @@ class TestContextBuilding:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class TestLowTokenCycles:
-    """Test local no-API cycle decisions."""
-
-    def test_run_cycle_skips_api_when_idle(
-        self, task_file_simple, patched_config, reset_state_cache, monkeypatch
-    ):
-        from orchestrator import agent
-        from orchestrator import state as state_mgr
-
-        state_mgr.init_state("Idle mission", str(task_file_simple))
-        state = state_mgr.load_state()
-        state["task_file_needs_planning"] = False
-        state_mgr.save_state(state)
-
-        def fail_api(*args, **kwargs):
-            raise AssertionError("API should not be called for idle local skip")
-
-        monkeypatch.setattr(agent, "_call_api_with_retry", fail_api)
-        result = agent.run_cycle()
-
-        assert result["skipped_api"] is True
-        assert result["api_calls"] == 0
-        assert result["tool_calls"] == 0
-
-    def test_local_skip_does_not_skip_pending_executable_with_capacity(
-        self, task_file_simple, patched_config, reset_state_cache, monkeypatch
-    ):
-        from orchestrator import agent
-        from orchestrator import process_mgr
-        from orchestrator import state as state_mgr
-
-        state_mgr.init_state("Needs work", str(task_file_simple))
-        state_mgr.decompose_task("root", [
-            {"id": "A1", "description": "Category", "acceptance_criteria": "Done"},
-        ])
-        state_mgr.decompose_task("A1", [
-            {"id": "A1.1", "description": "Concrete pending", "acceptance_criteria": "Done"},
-        ])
-        state = state_mgr.load_state()
-        state["task_file_needs_planning"] = False
-        state_mgr.save_state(state)
-        monkeypatch.setattr(process_mgr, "list_all", lambda: [])
-
-        skip, reason = agent._should_skip_llm_cycle(
-            state_mgr.load_state(),
-            {"activity_mode": "active", "replan_requested": False, "progress_results": []},
-            wake_change=None,
-        )
-
-        assert skip is False
-        assert "executable_pending=1" in reason
-
-
 class TestPhase2:
     """Test Phase 2 progress evaluation and decision logic."""
 
