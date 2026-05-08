@@ -26,6 +26,9 @@ from .config import (
     ANTHROPIC_BASE_URL,
     ANTHROPIC_MODEL,
     ANTHROPIC_MAX_TOKENS,
+    AURA_COMPACT_CONTEXT,
+    AURA_MAX_API_CALLS_PER_CYCLE,
+    AURA_SKIP_LLM_WHEN_MONITORING,
     API_RETRY_COUNT,
     API_RETRY_BASE_DELAY,
     STUCK_THRESHOLD_CYCLES,
@@ -33,6 +36,7 @@ from .config import (
     REVIEW_NUDGE_INTERVAL,
     MEMORY_DIR,
     STATE_DIR,
+    MAX_CONCURRENT_TASKS,
 )
 from .tools import TOOL_DEFINITIONS, execute_tool
 from . import state as state_mgr
@@ -286,6 +290,15 @@ def _collect_status_counts(tasks: list) -> dict[str, int]:
     return counts
 
 
+def _count_executable_pending(tasks: list) -> int:
+    count = 0
+    for task in tasks:
+        if task.get("status") == "pending" and int(task.get("depth", 0)) >= 2:
+            count += 1
+        count += _count_executable_pending(task.get("children", []))
+    return count
+
+
 def _format_phase2_summary(p2_result: dict | None) -> str:
     if not p2_result:
         return "(not available)"
@@ -322,23 +335,38 @@ def _format_phase2_summary(p2_result: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _task_ids_for_workspace_snapshot(active_tasks: list, last_decisions: list) -> list[str]:
+def _task_ids_for_workspace_snapshot(
+    active_tasks: list, last_decisions: list, max_ids: int | None = None
+) -> list[str]:
+    max_ids = max_ids or (4 if AURA_COMPACT_CONTEXT else 8)
     ids: list[str] = []
     for task_id in active_tasks:
         if task_id and task_id not in ids:
             ids.append(task_id)
+        if len(ids) >= max_ids:
+            return ids
     for decision in reversed(last_decisions):
         task_id = decision.get("task_id")
         if task_id and task_id not in ids:
             ids.append(task_id)
-        if len(ids) >= 8:
+        if len(ids) >= max_ids:
             break
     return ids
 
 
-def _format_workspace_snapshot(task_ids: list[str], active_tasks: list) -> str:
+def _format_workspace_snapshot(
+    task_ids: list[str],
+    active_tasks: list,
+    result_max_chars: int | None = None,
+    output_max_chars: int | None = None,
+    output_max_lines: int | None = None,
+) -> str:
     if not task_ids:
         return "(no active or recent task workspaces)"
+
+    result_max_chars = result_max_chars or (600 if AURA_COMPACT_CONTEXT else 1400)
+    output_max_chars = output_max_chars or (900 if AURA_COMPACT_CONTEXT else 2500)
+    output_max_lines = output_max_lines or (10 if AURA_COMPACT_CONTEXT else 25)
 
     tasks_root = os.path.join(get_workspace_dir(), "tasks")
     chunks: list[str] = []
@@ -371,7 +399,7 @@ def _format_workspace_snapshot(task_ids: list[str], active_tasks: list) -> str:
         result_path = os.path.join(task_dir, "result.md")
         if os.path.exists(result_path):
             chunk.append("\nresult.md preview:\n```text")
-            chunk.append(_read_text_preview(result_path, max_chars=1400))
+            chunk.append(_read_text_preview(result_path, max_chars=result_max_chars))
             chunk.append("```")
 
         if task_id in active_tasks:
@@ -379,7 +407,11 @@ def _format_workspace_snapshot(task_ids: list[str], active_tasks: list) -> str:
             if not os.path.exists(output_path):
                 output_path = os.path.join(task_dir, "output.txt")
             chunk.append("\nactive output tail:\n```text")
-            chunk.append(_read_tail_preview(output_path, max_lines=25, max_chars=2500))
+            chunk.append(_read_tail_preview(
+                output_path,
+                max_lines=output_max_lines,
+                max_chars=output_max_chars,
+            ))
             chunk.append("```")
 
         chunks.append("\n".join(chunk))
@@ -407,17 +439,21 @@ def build_context_message(
     root_children = state.get("tasks", [{}])[0].get("children", []) if state.get("tasks") else []
     task_file_changed = bool(wake_change and wake_change.get("changed"))
     task_file_needs_planning = bool(state.get("task_file_needs_planning"))
+    compact_context = AURA_COMPACT_CONTEXT and not task_file_changed and not task_file_needs_planning
     progress_preview = _read_text_preview(
         os.path.join(STATE_DIR, "progress.md"),
-        max_chars=4500,
+        max_chars=900 if compact_context else 4500,
     )
     session_preview = _read_text_preview(
         os.path.join(MEMORY_DIR, "session.md"),
-        max_chars=1800,
+        max_chars=500 if compact_context else 1800,
     )
     workspace_snapshot = _format_workspace_snapshot(
         _task_ids_for_workspace_snapshot(active_tasks, last_decisions),
         active_tasks,
+        result_max_chars=500 if compact_context else 1400,
+        output_max_chars=800 if compact_context else 2500,
+        output_max_lines=8 if compact_context else 25,
     )
     phase2_summary = _format_phase2_summary(p2_result)
     project_context = state.get("project_context", {}) or {}
@@ -454,8 +490,11 @@ def build_context_message(
         task_file_path = os.path.join(PROJECT_ROOT, task_file)
         project_name = get_project_name_for_task(task_file)
         if os.path.exists(task_file_path):
-            task_file_preview = _read_text_preview(task_file_path, max_chars=5000)
             planning_needed = (not root_children) or task_file_changed or task_file_needs_planning
+            if compact_context and not planning_needed:
+                task_file_preview = "(omitted in compact monitoring context; no task-file change and planning not needed)"
+            else:
+                task_file_preview = _read_text_preview(task_file_path, max_chars=5000)
             # ── R7: 优先使用 per-wake diff 信息（更详细）──────
             if wake_change and wake_change.get("changed"):
                 changelog_info = _format_wake_change_info(task_file, wake_change)
@@ -572,6 +611,50 @@ _STATE_CHANGING_TOOLS = {
     "decompose_task",
     "update_project_context",
 }
+
+
+def _should_skip_llm_cycle(
+    state: dict,
+    p2_result: dict,
+    wake_change: dict | None,
+) -> tuple[bool, str]:
+    """Return whether this cycle can be handled locally without an API call."""
+    if not AURA_SKIP_LLM_WHEN_MONITORING:
+        return False, "local skip disabled"
+    if _safe_mode:
+        return False, "safe mode needs LLM self-healing"
+    if wake_change and wake_change.get("changed"):
+        return False, "task file changed"
+    if state.get("task_file_needs_planning"):
+        return False, "planning needed"
+    if p2_result.get("replan_requested"):
+        return False, "replan requested"
+
+    progress_results = p2_result.get("progress_results", [])
+    if any(item.get("is_stuck") for item in progress_results):
+        return False, "at least one active task is stuck"
+
+    tasks = state.get("tasks", [])
+    executable_pending = _count_executable_pending(tasks)
+    active_tasks = state.get("active_tasks", [])
+    running_workers = [w for w in process_mgr.list_all() if w.get("running")]
+
+    if not active_tasks and not running_workers and executable_pending == 0:
+        return True, "idle: no active, running, or executable pending tasks"
+
+    active_or_running = bool(active_tasks or running_workers)
+    at_capacity = len(running_workers) >= MAX_CONCURRENT_TASKS
+    no_more_executable_work = executable_pending == 0
+    if active_or_running and (at_capacity or no_more_executable_work):
+        return True, (
+            "monitoring active workers locally: "
+            f"running={len(running_workers)}, executable_pending={executable_pending}"
+        )
+
+    return False, (
+        "LLM needed: "
+        f"running={len(running_workers)}, executable_pending={executable_pending}"
+    )
 
 
 def _render_progress_safely(reason: str = "") -> None:
@@ -751,6 +834,25 @@ def run_cycle(wake_change: dict | None = None) -> dict:
     active_tasks = state.get("active_tasks", [])
     p2_result = _run_phase2_eval(active_tasks, wake_change=wake_change)
 
+    skip_llm, skip_reason = _should_skip_llm_cycle(state, p2_result, wake_change)
+    if skip_llm:
+        print(f"[Orchestrator] Local skip: {skip_reason}")
+        _update_session(cycle_num, 0, p2_result)
+        elapsed = time.time() - cycle_start
+        return {
+            "cycle": cycle_num,
+            "tool_calls": 0,
+            "api_calls": 0,
+            "elapsed": round(elapsed, 2),
+            "error": False,
+            "activity_mode": p2_result["activity_mode"],
+            "replan_requested": p2_result["replan_requested"],
+            "review_requested": False,
+            "safe_mode": _safe_mode,
+            "skipped_api": True,
+            "skip_reason": skip_reason,
+        }
+
     # ── Build context and call API ──────────────────────────────────
     context_msg = build_context_message(wake_change=wake_change, p2_result=p2_result)
 
@@ -771,6 +873,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
 
     messages = [{"role": "user", "content": context_msg}]
     tool_call_count = 0
+    api_call_count = 0
 
     try:
         while True:
@@ -780,6 +883,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 messages=messages,
                 tools=TOOL_DEFINITIONS,
             )
+            api_call_count += 1
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
@@ -805,6 +909,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 return {
                     "cycle": cycle_num,
                     "tool_calls": tool_call_count,
+                    "api_calls": api_call_count,
                     "elapsed": round(elapsed, 2),
                     "error": False,
                     "activity_mode": p2_result["activity_mode"],
@@ -824,6 +929,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
             })
 
             tool_results = []
+            state_changed = False
             for tool_use in tool_uses:
                 tool_name = tool_use.name
                 tool_input = tool_use.input if isinstance(tool_use.input, dict) else {}
@@ -832,6 +938,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 result_str = execute_tool(tool_name, tool_input)
                 tool_call_count += 1
                 if tool_name in _STATE_CHANGING_TOOLS:
+                    state_changed = True
                     _render_progress_safely(tool_name)
 
                 tool_results.append({
@@ -845,6 +952,29 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 "content": tool_results,
             })
 
+            if api_call_count >= max(1, AURA_MAX_API_CALLS_PER_CYCLE):
+                reason = (
+                    f"API call cap reached ({AURA_MAX_API_CALLS_PER_CYCLE}); "
+                    "executed tool batch and will observe results next cycle"
+                )
+                print(f"\n[Orchestrator] {reason}.")
+                _update_session(cycle_num, tool_call_count, p2_result)
+                elapsed = time.time() - cycle_start
+                return {
+                    "cycle": cycle_num,
+                    "tool_calls": tool_call_count,
+                    "api_calls": api_call_count,
+                    "elapsed": round(elapsed, 2),
+                    "error": False,
+                    "activity_mode": p2_result["activity_mode"],
+                    "replan_requested": p2_result["replan_requested"],
+                    "review_requested": False,
+                    "safe_mode": _safe_mode,
+                    "api_call_cap_reached": True,
+                    "state_changed": state_changed,
+                    "summary": reason,
+                }
+
     except Exception as e:
         print(f"[ERROR] Cycle API call failed: {e}")
         import traceback
@@ -857,6 +987,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
         return {
             "cycle": cycle_num,
             "tool_calls": tool_call_count,
+            "api_calls": api_call_count,
             "elapsed": round(elapsed, 2),
             "error": True,
             "error_message": str(e),
