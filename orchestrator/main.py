@@ -838,11 +838,10 @@ def _run_deep_reflection_cycle() -> dict:
 def cmd_start(args):
     """Start the orchestrator main loop."""
     # ── Crash diagnostics: dump traceback on SIGSEGV/SIGABRT/etc ──
-    crash_log = os.path.join(DATA_DIR, "crash.log")
-    try:
-        faulthandler.enable(file=open(crash_log, "a", buffering=1))
-    except Exception:
-        pass  # Best-effort only
+    global _crash_log_file
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _crash_log_file = open(os.path.join(DATA_DIR, "crash.log"), "a", buffering=1)
+    faulthandler.enable(_crash_log_file, all_threads=True)
 
     print(get_startup_banner())
     global _running, _shutdown_requested, _consecutive_api_errors, _llm_dead, _process_start_time
@@ -1036,23 +1035,37 @@ def cmd_start(args):
                     state_mgr.save_state(state)
                     # Fall through to normal run_cycle below
                 else:
-                    result = _run_deep_reflection_cycle()
-                    cycle_count += 1
-                    # Status line
-                    print(f"  [Cycle #{cycle_count} | deep reflection | mode: {result.get('activity_mode', 'review')}]")
-                    # Session token tracking
-                    review_usage = result.get("token_usage", {})
-                    accumulate_session(cycle_count, review_usage, "deep_reflection")
-                    print(format_session_display(review_usage, "deep_reflection"))
-                    _render_progress_safely("deep reflection")
-                    if not _running:
-                        break
                     try:
-                        _save_project(project_name)
-                    except Exception as save_err:
-                        print(f"  [WARN] Project save failed: {save_err}")
-                    _sleep_until_next_wake(interval)
-                    continue
+                        result = _run_deep_reflection_cycle()
+                    except BaseException as e:
+                        print(f"\n  [DEEP REFLECTION] Crashed: {type(e).__name__}: {e}")
+                        print(f"  [DEEP REFLECTION] Falling back to normal cycle next wake.")
+                        state = state_mgr.load_state()
+                        state["last_deep_review_time"] = datetime.now().isoformat()
+                        state_mgr.save_state(state)
+                        if isinstance(e, (KeyboardInterrupt, ShutdownRequested)):
+                            raise
+                        if isinstance(e, SystemExit):
+                            print(f"  [DEEP REFLECTION] SystemExit intercepted (code={e.code!r}), continuing.")
+                        # Fall through to normal run_cycle below
+                        result = None
+                    if result is not None:
+                        cycle_count += 1
+                        # Status line
+                        print(f"  [Cycle #{cycle_count} | deep reflection | mode: {result.get('activity_mode', 'review')}]")
+                        # Session token tracking
+                        review_usage = result.get("token_usage", {})
+                        accumulate_session(cycle_count, review_usage, "deep_reflection")
+                        print(format_session_display(review_usage, "deep_reflection"))
+                        _render_progress_safely("deep reflection")
+                        if not _running:
+                            break
+                        try:
+                            _save_project(project_name)
+                        except Exception as save_err:
+                            print(f"  [WARN] Project save failed: {save_err}")
+                        _sleep_until_next_wake(interval)
+                        continue
 
             result = run_cycle(wake_change=wake_change)
             cycle_count += 1
@@ -1117,6 +1130,18 @@ def cmd_start(args):
         except Exception as e:
             print(f"\n[ERROR] Unexpected crash in cycle: {e}")
             _render_progress_safely("unexpected cycle crash")
+            import traceback
+            traceback.print_exc()
+        except BaseException as e:
+            # Only KeyboardInterrupt / ShutdownRequested should stop the loop.
+            # SystemExit from libraries (e.g. argparse, multiprocessing) must
+            # not kill the orchestrator process.
+            if isinstance(e, (KeyboardInterrupt, ShutdownRequested)):
+                raise
+            if isinstance(e, SystemExit):
+                print(f"\n[WARN] SystemExit intercepted (code={e.code!r}), continuing main loop.")
+                continue
+            print(f"\n[ERROR] Fatal error in cycle ({type(e).__name__}): {e}")
             import traceback
             traceback.print_exc()
 

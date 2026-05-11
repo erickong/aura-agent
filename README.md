@@ -4,6 +4,46 @@ Aura Agent is a two-layer autonomous task orchestrator. You give it a long-runni
 
 It is designed for people who want an agent that can keep working across many cycles without losing the task ledger, forgetting why a decision was made, or trusting a worker's self-report without checking artifacts.
 
+## Quick Start
+
+```bash
+# 1. Install Aura
+git clone https://github.com/erickong/aura-agent
+cd aura-agent
+pip install -e .
+
+# 2. One-time setup (API key, model, defaults)
+aura setup
+
+# 3. Create a task file in your project directory
+cd /path/to/your/project
+echo "# Build a quantitative trading strategy with Sharpe > 2" > task.md
+echo "" >> task.md
+echo "Use a local SQLite database to store daily price data. Explore multiple" >> task.md
+echo "approaches: mean reversion, momentum, ML-based signals, or portfolio" >> task.md
+echo "optimization. The target is an annualized Sharpe ratio above 2.0 on" >> task.md
+echo "out-of-sample data. Backtest with realistic transaction costs and slippage." >> task.md
+
+# 4. Start the orchestrator
+aura task.md
+```
+
+You can edit `task.md` at any time while Aura is running — add new requirements, remove completed ones, or refine the goal. Aura detects file changes on each wake cycle and automatically replans.
+
+### Task File Format
+
+A task file is plain Markdown. The first `# Heading` is your goal — Aura reads it as the mission. Everything below is additional context, constraints, or acceptance criteria.
+
+```markdown
+# Build a REST API for user management
+
+The API should support CRUD operations on users with role-based access control.
+Endpoints: POST /users, GET /users, GET /users/:id, PATCH /users/:id, DELETE /users/:id.
+Use FastAPI with SQLAlchemy async. Write tests with pytest.
+```
+
+Aura automatically decomposes the goal into a hierarchical task tree, spawns workers, and iterates until the goal is met. You can add, remove, or edit requirements mid-run — Aura detects task file changes on each wake cycle.
+
 ## Why Use Aura
 
 Most coding agents are excellent inside a single session. Aura is aimed at a different problem: multi-hour or multi-day goal execution.

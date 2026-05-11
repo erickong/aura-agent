@@ -834,6 +834,10 @@ current-task evidence.
 - Current working directory: {task_dir}
 - This current directory is the task output directory. Put all outputs here.
 
+## Process Safety Rule
+Do not use `taskkill /IM python.exe`, `taskkill /F /IM python.exe`, `pkill python`,
+or `killall python`. Only terminate subprocesses started by the current task itself.
+
 ## Hard Resource Policy
 {process_mgr.resource_policy_text()}
 
