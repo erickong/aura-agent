@@ -49,7 +49,10 @@ def get_workspace_dir():
 
 
 CYCLE_INTERVAL_SECONDS = int(os.environ.get("AURA_CYCLE_INTERVAL", "300"))
-DEEP_REVIEW_INTERVAL_CYCLES = int(os.environ.get("AURA_DEEP_REVIEW_INTERVAL", "12"))
+# Deep reflection interval — independent of wake cycles. A deep reflection
+# replaces a normal wake cycle when the process has been running for this
+# many minutes AND the last deep reflection was at least this long ago.
+DEEP_REFLECTION_INTERVAL_MINUTES = int(os.environ.get("AURA_DEEP_REFLECTION_INTERVAL", "120"))
 LLM_DEAD_THROTTLE_SECONDS = int(os.environ.get("AURA_LLM_DEAD_THROTTLE", "300"))
 
 MAX_CONCURRENT_TASKS = int(os.environ.get("AURA_MAX_CONCURRENT_TASKS", "2"))
@@ -81,7 +84,6 @@ LONG_TERM_MEMORY_MAX_CHARS = 3000
 SHORT_TERM_MEMORY_MAX_CHARS = 2000
 
 STUCK_THRESHOLD_CYCLES = 12
-REVIEW_NUDGE_INTERVAL = 10
 
 API_RETRY_COUNT = 4
 API_RETRY_BASE_DELAY = 5
@@ -92,3 +94,27 @@ FILE_CACHE_TTL_SECONDS = int(os.environ.get("AURA_FILE_CACHE_TTL", "60"))
 TASK_SUMMARY_ENABLED = os.environ.get("AURA_TASK_SUMMARY", "1") != "0"
 
 TASK_CLEANUP_AGE_DAYS = int(os.environ.get("AURA_TASK_CLEANUP_AGE", "7"))
+
+# ── Token optimization config ───────────────────────────────────────
+# Enable explicit cache_control headers (Anthropic native only).
+# DeepSeek auto-caches without explicit headers; setting this on DeepSeek
+# may cause errors. Default off.
+AURA_EXPLICIT_PROMPT_CACHE = os.environ.get("AURA_EXPLICIT_PROMPT_CACHE", "0") == "1"
+
+# Skip L1 LLM calls when workers are healthy and no decision is needed.
+# Set to "0" to disable the skip gate (always call L1 every cycle).
+AURA_SKIP_HEALTHY_CYCLES = os.environ.get("AURA_SKIP_HEALTHY_CYCLES", "1") != "0"
+
+# Maximum consecutive skipped cycles before forcing an L1 call.
+# Higher values reduce token cost when workers are progressing well.
+AURA_MAX_SKIPPED_CYCLES = int(os.environ.get("AURA_MAX_SKIPPED_CYCLES", "8"))
+
+# ── Token pricing per 1M tokens (USD) ────────────────────────────────
+TOKEN_PRICE_CACHE_HIT = float(os.environ.get("AURA_TOKEN_PRICE_CACHE_HIT", "0.145"))
+TOKEN_PRICE_CACHE_MISS = float(os.environ.get("AURA_TOKEN_PRICE_CACHE_MISS", "1.74"))
+TOKEN_PRICE_OUTPUT = float(os.environ.get("AURA_TOKEN_PRICE_OUTPUT", "1.74"))
+
+# ── Tool call budget hints (prompt guidance only, not hard limits) ──
+TOOL_CALL_BUDGET_NORMAL = int(os.environ.get("AURA_TOOL_CALL_BUDGET_NORMAL", "12"))
+TOOL_CALL_BUDGET_DIAGNOSTIC = int(os.environ.get("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40"))
+TOOL_CALL_BUDGET_PLANNING = int(os.environ.get("AURA_TOOL_CALL_BUDGET_PLANNING", "40"))

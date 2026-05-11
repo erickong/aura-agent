@@ -12,6 +12,7 @@ module fails to import or crashes at runtime, the orchestrator degrades
 gracefully to basic mode and can spawn Layer 2 workers to self-heal.
 """
 
+import hashlib
 import json
 import os
 import time
@@ -30,9 +31,15 @@ from .config import (
     API_RETRY_BASE_DELAY,
     STUCK_THRESHOLD_CYCLES,
     get_workspace_dir,
-    REVIEW_NUDGE_INTERVAL,
     MEMORY_DIR,
     STATE_DIR,
+    AURA_EXPLICIT_PROMPT_CACHE,
+    AURA_SKIP_HEALTHY_CYCLES,
+    AURA_MAX_SKIPPED_CYCLES,
+    MAX_CONCURRENT_TASKS,
+    TOOL_CALL_BUDGET_NORMAL,
+    TOOL_CALL_BUDGET_DIAGNOSTIC,
+    TOOL_CALL_BUDGET_PLANNING,
 )
 from .tools import TOOL_DEFINITIONS, execute_tool
 from . import state as state_mgr
@@ -43,6 +50,7 @@ from .changelog import (
     get_file_change_info,
     get_project_name_for_task,
 )
+from .token_tracker import log_usage, log_skip, format_cycle_stats, extract_usage
 
 # ── RESILIENT IMPORTS: Phase modules with safe fallbacks ─────────────
 # Each upgrade module is loaded in a try/except. If loading fails,
@@ -130,6 +138,11 @@ For each active task, evaluate:
 - How long has it been running vs. its budget?
 - Is it making meaningful activity or is it stuck in a loop?
 - Does the output actually contribute to the mission?
+
+**Output reading policy** (ENFORCED — read_file tool blocks violations):
+- If a task has `has_result_md: true`, read **result.md**. Do NOT attempt to read output.jsonl — the tool will block it. result.md is 300x smaller and contains the actual result.
+- For active tasks WITHOUT result.md, the Phase 2 monitoring line in the digest is sufficient. Do NOT read output.jsonl — the tool will block it. Only exception states (STUCK/LOOPING) include a raw tail for diagnosis.
+- Do not list_directory or read config files for completed tasks (has_result_md=true) unless the current cycle needs that specific evidence for a state-changing decision (e.g. replan, spawn a follow-up task).
 
 ### 3. DECISION
 Based on evaluation, choose one or more:
@@ -387,18 +400,184 @@ def _format_workspace_snapshot(task_ids: list[str], active_tasks: list) -> str:
     return "\n\n".join(chunks)
 
 
+def _format_workspace_digest(task_ids: list[str], active_tasks: list, p2_result: dict | None = None) -> str:
+    """Lightweight structured workspace summary — only raw tail for exceptions.
+
+    Output.jsonl data is hidden for healthy workers and completed tasks to
+    prevent the LLM from wasting tokens on raw worker logs. The LLM should
+    read result.md for outcomes and trust Phase 2 signals for progress.
+
+    Layout per task state:
+      - has_result_md=True:  status + artifacts + result.md preview (no output.jsonl fields)
+      - healthy running:     Phase 2 monitoring summary line (no raw size/hash fields)
+      - stuck/looping/idle:  full signals + raw output tail for diagnosis
+    """
+    if not task_ids:
+        return "(no active or recent task workspaces)"
+
+    # Build a lookup from Phase 2 progress results
+    progress_by_id: dict[str, dict] = {}
+    if p2_result:
+        for pr in p2_result.get("progress_results", []):
+            progress_by_id[pr.get("task_id", "")] = pr
+
+    tasks_root = os.path.join(get_workspace_dir(), "tasks")
+    chunks: list[str] = []
+    for task_id in task_ids:
+        task_dir = os.path.join(tasks_root, task_id)
+        if not os.path.isdir(task_dir):
+            chunks.append(f"### {task_id}\n(missing workspace)")
+            continue
+
+        pr = progress_by_id.get(task_id, {})
+        is_active = task_id in active_tasks
+        is_stuck = pr.get("is_stuck", False)
+        is_looping = pr.get("is_looping", False)
+        has_no_delta = pr.get("output_delta", -1) == 0
+        cpu = pr.get("cpu_percent", 0.0)
+        output_delta = pr.get("output_delta", 0)
+        content_changed = pr.get("content_changed", False)
+        active_score = pr.get("active_score", 0.0)
+
+        # ── result.md check (filesystem, always authoritative) ──────
+        result_path = os.path.join(task_dir, "result.md")
+        has_result = os.path.exists(result_path)
+
+        # ── Determine task health category ──────────────────────────
+        is_exception = is_stuck or is_looping or (has_no_delta and is_active and cpu < 0.5 and not has_result)
+
+        lines = [f"### {task_id}"]
+
+        # ── Status line ─────────────────────────────────────────────
+        if has_result:
+            lines.append(f"- status: completed (has result.md)")
+        elif is_active:
+            lines.append(f"- status: running")
+        else:
+            lines.append(f"- status: recent (no worker running)")
+
+        # ── Phase 2 monitoring (only for exception states without result.md) ──
+        # Healthy workers: hide output.jsonl details to reduce LLM temptation.
+        # Completed tasks: output.jsonl is irrelevant, result.md is the source.
+        if has_result:
+            # Completed task — output.jsonl fields are noise. Only show
+            # artifacts and the result.md preview.
+            lines.append(f"- artifacts: {', '.join(pr.get('artifacts', [])[:5]) or '(none)'}")
+            if pr.get("error_log_size", 0) > 0:
+                lines.append(f"- error_log_size: {pr['error_log_size']} (errors present)")
+            lines.append(f"- has_result_md: True")
+
+            lines.append("\nresult.md preview:\n```text")
+            lines.append(_read_text_preview(result_path, max_chars=1000))
+            lines.append("```")
+
+        elif is_exception:
+            # Exception state — show full signals for diagnosis
+            lines.append(f"- output_size: {pr.get('output_size', 0)}")
+            lines.append(f"- output_delta: {output_delta}")
+            lines.append(f"- tail_hash_changed: {content_changed}")
+            lines.append(f"- active_score: {active_score:.2f}")
+            lines.append(f"- cpu_percent: {cpu:.1f}%")
+            lines.append(f"- artifacts: {', '.join(pr.get('artifacts', [])[:5]) or '(none)'}")
+            lines.append(f"- new_artifacts: {', '.join(pr.get('new_artifacts', [])[:5]) or '(none)'}")
+            lines.append(f"- error_log_size: {pr.get('error_log_size', 0)}")
+            lines.append(f"- has_result_md: False")
+            if is_stuck:
+                lines.append("- **STUCK**")
+            if is_looping:
+                lines.append("- **LOOPING**")
+
+            # Raw output tail for live diagnosis
+            output_path = os.path.join(task_dir, "output.jsonl")
+            if not os.path.exists(output_path):
+                output_path = os.path.join(task_dir, "output.txt")
+            lines.append("\nactive output tail (exception state):\n```text")
+            lines.append(_read_tail_preview(output_path, max_lines=20, max_chars=2000))
+            lines.append("```")
+
+        else:
+            # Healthy active worker without result.md — condensed Phase 2 summary
+            delta_str = f"+{output_delta}" if output_delta > 0 else str(output_delta)
+            lines.append(
+                f"- Phase 2 monitoring: delta={delta_str}, content_changed={content_changed}, "
+                f"score={active_score:.2f}, cpu={cpu:.1f}% — healthy, do NOT read output.jsonl"
+            )
+            lines.append(f"- artifacts: {', '.join(pr.get('artifacts', [])[:5]) or '(none)'}")
+            lines.append(f"- new_artifacts: {', '.join(pr.get('new_artifacts', [])[:5]) or '(none)'}")
+            if pr.get("error_log_size", 0) > 0:
+                lines.append(f"- error_log_size: {pr['error_log_size']} (errors present)")
+            lines.append(f"- has_result_md: False")
+
+        chunks.append("\n".join(lines))
+
+    return "\n\n".join(chunks)
+
+
+def _get_task_file_block(state: dict, wake_change: dict | None) -> tuple[str, bool]:
+    """Return task file content block and whether planning is needed.
+
+    When planning IS needed or task file changed: return full text (up to 5000 chars).
+    When planning is NOT needed: return hash + summary only.
+    This keeps the stable prefix cacheable when nothing changed.
+    """
+    task_file = state.get("task_file", "")
+    if not task_file:
+        return "(no task file recorded)", False
+
+    from .config import PROJECT_ROOT, PROJECTS_DIR
+    task_file_path = os.path.join(PROJECT_ROOT, task_file)
+    if not os.path.exists(task_file_path):
+        return f"(task file not found: {task_file})", False
+
+    root_children = state.get("tasks", [{}])[0].get("children", []) if state.get("tasks") else []
+    task_file_changed = bool(wake_change and wake_change.get("changed"))
+    task_file_needs_planning = bool(state.get("task_file_needs_planning"))
+    planning_needed = (not root_children) or task_file_changed or task_file_needs_planning
+
+    if planning_needed or task_file_changed:
+        # Full content for planning/changes
+        content = _read_text_preview(task_file_path, max_chars=5000)
+        return content, planning_needed
+
+    # Stable summary — hash ensures cache can be keyed on content identity
+    try:
+        with open(task_file_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        file_hash = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+        first_lines = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("<!--")][:3]
+        summary = "\n".join(first_lines) if first_lines else "(empty)"
+    except OSError:
+        file_hash = "unreadable"
+        summary = "(unreadable)"
+
+    block = (
+        f"Task file hash: {file_hash}\n"
+        f"Task file summary (first lines):\n{summary}"
+    )
+    return block, planning_needed
+
+
 def build_context_message(
     wake_change: dict | None = None,
     p2_result: dict | None = None,
 ) -> str:
     """Build the context message that describes the current state to the orchestrator.
 
+    OPTIMIZATION: Returns a string with two logical sections:
+      1. Stable prefix (mission, project context, task file, durable rules)
+      2. Dynamic delta (cycle, active tasks, Phase 2, workspace digest, wake change)
+
+    These are returned as a single string for backward compatibility.
+    The stable content is positioned first so DeepSeek's automatic KV-cache
+    can reuse it across cycles.
+
     Args:
         wake_change: Result from changelog.check_task_file_on_wake(), or None.
-                     When present and changed==True, includes diff analysis hints.
+        p2_result: Phase 2 evaluation result, or None.
     """
     state = state_mgr.load_state()
-    task_tree = state_mgr.get_task_tree_summary()
+    task_tree_structure = state_mgr.get_task_tree_structure()
+    task_tree_status = state_mgr.get_task_tree_status()
     active_tasks = state.get("active_tasks", [])
     decision_log = state.get("decision_log", [])
     last_decisions = decision_log[-5:] if decision_log else []
@@ -407,19 +586,9 @@ def build_context_message(
     root_children = state.get("tasks", [{}])[0].get("children", []) if state.get("tasks") else []
     task_file_changed = bool(wake_change and wake_change.get("changed"))
     task_file_needs_planning = bool(state.get("task_file_needs_planning"))
-    progress_preview = _read_text_preview(
-        os.path.join(STATE_DIR, "progress.md"),
-        max_chars=4500,
-    )
-    session_preview = _read_text_preview(
-        os.path.join(MEMORY_DIR, "session.md"),
-        max_chars=1800,
-    )
-    workspace_snapshot = _format_workspace_snapshot(
-        _task_ids_for_workspace_snapshot(active_tasks, last_decisions),
-        active_tasks,
-    )
-    phase2_summary = _format_phase2_summary(p2_result)
+    planning_needed = (not root_children) or task_file_changed or task_file_needs_planning
+
+    # ── Stable prefix section ──────────────────────────────────────
     project_context = state.get("project_context", {}) or {}
     project_context_text = (
         f"Final goal: {project_context.get('final_goal') or '(not set)'}\n"
@@ -430,8 +599,31 @@ def build_context_message(
         f"Updated: {project_context.get('updated_at') or '(never)'}"
     )
 
+    task_file = state.get("task_file", "")
+    task_file_block, _pf = _get_task_file_block(state, wake_change)
+
+    # ── Changelog info (dynamic — only appears when file changed) ──
+    changelog_info = ""
+    if task_file and task_file_changed:
+        from .config import PROJECT_ROOT, PROJECTS_DIR
+        task_file_path = os.path.join(PROJECT_ROOT, task_file)
+        project_name = get_project_name_for_task(task_file)
+        if wake_change and wake_change.get("changed"):
+            changelog_info = _format_wake_change_info(task_file, wake_change)
+        else:
+            change_info = get_file_change_info(task_file_path, PROJECTS_DIR, project_name)
+            if change_info["is_changed"]:
+                changelog_info = (
+                    f"\n\n### ⚠️ 任务文件已变更\n"
+                    f"检测到 {task_file} 内容已更新！\n"
+                    f"上次处理哈希: {change_info['previous_hash'][:12]}...\n"
+                    f"当前哈希: {change_info['current_hash'][:12]}...\n"
+                    f"请读取任务文件内容，识别新增/变更的任务项，并更新任务树。\n"
+                )
+
+    # ── Dynamic delta section ─────────────────────────────────────
     running_info = ""
-    running_tasks = process_mgr.list_all()
+    running_tasks = [w for w in process_mgr.list_all() if w.get("running")]
     if running_tasks:
         for rt in running_tasks:
             running_info += (f"\n- {rt['task_id']} | PID: {rt['pid']} | "
@@ -444,33 +636,23 @@ def build_context_message(
     for d in last_decisions:
         last_decision_str += f"\n  [{d['time'][:19]}] {d['task_id']}: {d['old_status']} → {d['new_status']} — {d['reason']}"
 
-    # ── Changelog info: 检测 task.md 文件是否有变更 ──
-    changelog_info = ""
-    task_file = state.get("task_file", "")
-    task_file_preview = "(no task file recorded)"
-    planning_needed = False
-    if task_file:
-        from .config import PROJECT_ROOT, PROJECTS_DIR
-        task_file_path = os.path.join(PROJECT_ROOT, task_file)
-        project_name = get_project_name_for_task(task_file)
-        if os.path.exists(task_file_path):
-            task_file_preview = _read_text_preview(task_file_path, max_chars=5000)
-            planning_needed = (not root_children) or task_file_changed or task_file_needs_planning
-            # ── R7: 优先使用 per-wake diff 信息（更详细）──────
-            if wake_change and wake_change.get("changed"):
-                changelog_info = _format_wake_change_info(task_file, wake_change)
-            else:
-                change_info = get_file_change_info(task_file_path, PROJECTS_DIR, project_name)
-                if change_info["is_changed"]:
-                    changelog_info = (
-                        f"\n\n### ⚠️ 任务文件已变更\n"
-                        f"检测到 {task_file} 内容已更新！\n"
-                        f"上次处理哈希: {change_info['previous_hash'][:12]}...\n"
-                        f"当前哈希: {change_info['current_hash'][:12]}...\n"
-                        f"请读取任务文件内容，识别新增/变更的任务项，并更新任务树。\n"
-                    )
+    # ── Session memory: shrink to 500 chars max ──────────────────
+    session_preview = _read_text_preview(
+        os.path.join(MEMORY_DIR, "session.md"),
+        max_chars=500,
+    )
 
-    context = f"""## Current State Snapshot
+    # ── Workspace: digest by default ─────────────────────────────
+    workspace_snapshot = _format_workspace_digest(
+        _task_ids_for_workspace_snapshot(active_tasks, last_decisions),
+        active_tasks,
+        p2_result,
+    )
+
+    phase2_summary = _format_phase2_summary(p2_result)
+
+    # ── Assemble: stable prefix first, then dynamic delta ─────────
+    context = f"""## Stable Project Context
 
 ### Mission
 {state.get('mission', 'NOT SET')}
@@ -478,30 +660,46 @@ def build_context_message(
 ### Project Context
 {project_context_text}
 
-### Cycle
-Cycle #{state.get('total_cycles', 0)} | Created: {state.get('created_at', 'unknown')}
-
 ### Aura Data Directory
 {os.path.dirname(STATE_DIR)}
 
 ### Task File
 Path: {task_file or '(none)'}
-Changed this wake: {task_file_changed}
-Planning needed: {planning_needed}
 Current task batch prefix for new top-level categories: {state.get('task_batch', {}).get('current_prefix', 'A')}
 
 ```markdown
-{task_file_preview}
+{task_file_block}
 ```
 
-### Task Tree
-{task_tree}
+### Task Tree (stable structure)
+{task_tree_structure}
+
+### Durable Rules
+- Use the dynamic cycle delta below for current decisions.
+- Do not re-read files already summarized unless evidence is missing for a state-changing decision.
+- If Planning needed is True, use the task file content above.
+- Never spawn root or top-level category nodes (A1/B1). Workers go at level 3+ (A1.1).
+- Max {MAX_CONCURRENT_TASKS} concurrent workers.
+- Tool call budget: ~{TOOL_CALL_BUDGET_NORMAL} for normal cycles, ~{TOOL_CALL_BUDGET_PLANNING} for diagnostic/planning. Use fewer when possible — the budget is guidance, not a target.
+- Every status change needs reason AND evidence.
+
+---
+
+## Dynamic Cycle Delta
+
+### Cycle
+Cycle #{state.get('total_cycles', 0)} | Created: {state.get('created_at', 'unknown')}
+Changed this wake: {task_file_changed}
+Planning needed: {planning_needed}
 
 ### Active Tasks
 {active_tasks if active_tasks else '(none)'}
 
 ### Task Status Counts
 {status_counts}
+
+### Task Tree Status (dynamic)
+{task_tree_status}
 
 ### Running Processes
 {running_info if running_info else '(none)'}
@@ -512,17 +710,12 @@ Current task batch prefix for new top-level categories: {state.get('task_batch',
 ### Phase 2 Progress Signals
 {phase2_summary}
 
-### Session Memory Preview
+### Session Memory (current focus)
 ```text
 {session_preview}
 ```
 
-### Progress Report Preview
-```text
-{progress_preview}
-```
-
-### Workspace Snapshot (active + recent tasks)
+### Workspace Digest (active + recent tasks)
 {workspace_snapshot}
 {changelog_info}
 
@@ -540,30 +733,128 @@ Now assess the situation and decide what to do.
 - If there are no active tasks, no running processes, no pending tasks (pending={pending_count}), no task-file change, and Planning needed is False, use no_op without extra file reads.
 - Otherwise take action (spawn, kill, update, decompose, write_memory, or no_op) and record evidence for any status change."""
 
-    # ── Phase 3: Review nudge injection ──────────────────────────
-    if _cycle_since_last_review >= REVIEW_NUDGE_INTERVAL:
-        context += (
-            f"\n\n## Review Nudge (P3)\n\n"
-            f"{_cycle_since_last_review} cycles have passed since the last reflection review. "
-            f"Consider running a review to evaluate strategy and progress. "
-            f"Ask yourself: Is the current approach working? Are there stuck tasks? "
-            f"Should the strategy be adjusted?\n"
-        )
-
     return context
 
 
-# ── Phase 2: Resilient progress tracking state ──────────────────────
+def _is_freshly_progressing(p: dict) -> bool:
+    """Check if a worker is making fresh progress this cycle (not just resting on old artifacts)."""
+    return (
+        p.get("output_delta", 0) > 0
+        or p.get("content_changed", False)
+        or p.get("cpu_percent", 0.0) > 0.5
+        or bool(p.get("new_artifacts", []))
+    )
+
+
+def _check_root_finalized(state: dict) -> bool:
+    """Return True if the root task is in a terminal state."""
+    tasks = state.get("tasks", [])
+    if not tasks:
+        return False
+    root = tasks[0]
+    return root.get("status") in {"completed", "failed", "archived"}
+
+
+def should_skip_l1_cycle(
+    state: dict | None = None,
+    wake_change: dict | None = None,
+    p2_result: dict | None = None,
+) -> tuple[bool, str]:
+    """Deterministic gate: decide if we can skip the L1 LLM call this cycle.
+
+    Returns (skip: bool, reason: str).
+
+    Skip only when ALL of these hold:
+    - Task file unchanged
+    - Planning not needed
+    - No replan requested
+    - No stuck/looping workers
+    - Workers are freshly progressing (output_delta > 0, content_changed, or CPU active)
+    - No free capacity for pending work
+    - OR: nothing running AND nothing pending AND root is finalized
+
+    This can eliminate 40-70% of L1 calls during healthy worker runs.
+    """
+    if not AURA_SKIP_HEALTHY_CYCLES:
+        return False, "skip gate disabled"
+
+    if state is None:
+        state = state_mgr.load_state()
+
+    # Task file changed → must call L1
+    if wake_change and wake_change.get("changed"):
+        return False, "task file changed"
+
+    # Planning needed → must call L1
+    if state.get("task_file_needs_planning"):
+        return False, "planning needed"
+
+    if p2_result is None:
+        return False, "no Phase 2 result"
+
+    # Replan requested → must call L1
+    if p2_result.get("replan_requested"):
+        return False, "replan requested"
+
+    progress_results = p2_result.get("progress_results", [])
+
+    # Stuck or looping → must call L1
+    if any(p.get("is_stuck") or p.get("is_looping") for p in progress_results):
+        return False, "worker stuck or looping"
+
+    # Count pending leaf tasks and running workers
+    all_tasks = state.get("tasks", [])
+    pending = _count_pending_leaf_tasks(all_tasks)
+    running_workers = [w for w in process_mgr.list_all() if w.get("running")]
+
+    # Free capacity and pending work → call L1 to spawn
+    if pending > 0 and len(running_workers) < MAX_CONCURRENT_TASKS:
+        return False, "free worker capacity and pending work"
+
+    # Workers running → skip only if ALL are freshly progressing
+    if running_workers and progress_results:
+        # Build lookup by task_id for progress results
+        pr_by_id = {p.get("task_id", ""): p for p in progress_results}
+        all_fresh = True
+        for w in running_workers:
+            pr = pr_by_id.get(w["task_id"], {})
+            if not _is_freshly_progressing(pr):
+                all_fresh = False
+                break
+        if all_fresh:
+            return True, "all workers freshly progressing"
+
+    # Nothing running and nothing pending → skip ONLY if root is finalized
+    if not running_workers and pending == 0 and not state.get("task_file_needs_planning"):
+        if not _check_root_finalized(state):
+            return False, "finalization needed — root not in terminal state"
+        return True, "nothing pending or running; root finalized"
+
+    return False, "needs L1 decision"
+
+
+def _count_pending_leaf_tasks(tasks: list) -> int:
+    """Count pending leaf tasks (tasks with no children that are pending)."""
+    count = 0
+    for task in tasks:
+        children = task.get("children", [])
+        if children:
+            count += _count_pending_leaf_tasks(children)
+        elif task.get("status") == "pending":
+            count += 1
+    return count
+
+# ── Phase 2 state (module-level, persists across cycles) ────────────
+_safe_mode: bool = False
+_consecutive_no_progress: int = 0
+_consecutive_crashes: int = 0
+MAX_CONSECUTIVE_CRASHES: int = 3
 _previous_output_sizes: dict[str, int] = {}
 _previous_content_hashes: dict[str, str] = {}
 _stuck_cycle_counters: dict[str, int] = {}
-_consecutive_no_progress: int = 0
-_consecutive_crashes: int = 0
-_safe_mode: bool = False
-MAX_CONSECUTIVE_CRASHES = 3
 
 # ── Phase 3: Review nudge tracking ───────────────────────────────────
-_cycle_since_last_review: int = 0
+_consecutive_skips: int = 0
 
 _STATE_CHANGING_TOOLS = {
     "spawn_task",
@@ -641,7 +932,10 @@ def _run_phase2_eval(active_tasks: list, wake_change: dict | None = None) -> dic
                 _stuck_cycle_counters[task_id] = 0
 
         any_progress = any(
-            p["output_delta"] > 0 or p["artifacts"] or p.get("content_changed")
+            p["output_delta"] > 0
+            or p.get("content_changed")
+            or p.get("new_artifacts")
+            or p.get("cpu_percent", 0.0) > 0.5
             for p in progress_results
         )
         if any_progress:
@@ -731,7 +1025,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
     - In safe mode, the orchestrator can still spawn fixer workers
     - Safe mode resets when Phase 2 is fixed (import succeeds)
     """
-    global _safe_mode, _cycle_since_last_review
+    global _safe_mode, _consecutive_skips
 
     cycle_start = time.time()
     cycle_num = state_mgr.log_cycle()
@@ -750,6 +1044,39 @@ def run_cycle(wake_change: dict | None = None) -> dict:
     state = state_mgr.load_state()
     active_tasks = state.get("active_tasks", [])
     p2_result = _run_phase2_eval(active_tasks, wake_change=wake_change)
+
+    # ── Deterministic skip gate ────────────────────────────────────
+    global _consecutive_skips
+    forced_l1_reason = ""
+    skip, skip_reason = should_skip_l1_cycle(state, wake_change, p2_result)
+    if skip and not _safe_mode:
+        _consecutive_skips += 1
+        if _consecutive_skips > AURA_MAX_SKIPPED_CYCLES:
+            skip = False
+            skip_reason = f"max consecutive skips ({AURA_MAX_SKIPPED_CYCLES}) reached"
+            forced_l1_reason = skip_reason
+            _consecutive_skips = 0
+        else:
+            log_skip(skip_reason)
+            print(f"  [Skip] Skipping L1 call: {skip_reason} (consecutive skips: {_consecutive_skips})")
+            _update_session(cycle_num, 0, p2_result)
+            elapsed = time.time() - cycle_start
+            return {
+                "cycle": cycle_num,
+                "tool_calls": 0,
+                "api_calls": 0,
+                "elapsed": round(elapsed, 2),
+                "error": False,
+                "activity_mode": p2_result["activity_mode"],
+                "replan_requested": p2_result["replan_requested"],
+                "review_requested": False,
+                "safe_mode": _safe_mode,
+                "token_usage": {},
+                "skipped": True,
+                "skip_reason": skip_reason,
+            }
+    else:
+        _consecutive_skips = 0
 
     # ── Build context and call API ──────────────────────────────────
     context_msg = build_context_message(wake_change=wake_change, p2_result=p2_result)
@@ -770,7 +1097,39 @@ def run_cycle(wake_change: dict | None = None) -> dict:
     )
 
     messages = [{"role": "user", "content": context_msg}]
+
+    # Apply explicit cache_control for Anthropic native prompt caching.
+    # Split into stable prefix (cacheable) and dynamic delta to maximise
+    # cache reuse across cycles. Only enabled for Anthropic native API
+    # because DeepSeek may not support the cache_control field.
+    if AURA_EXPLICIT_PROMPT_CACHE and "api.anthropic.com" in ANTHROPIC_BASE_URL:
+        parts = context_msg.split("\n---\n", 1)
+        if len(parts) == 2:
+            stable_prefix, dynamic_delta = parts
+            messages[0]["content"] = [
+                {
+                    "type": "text",
+                    "text": stable_prefix + "\n---\n",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": dynamic_delta,
+                },
+            ]
+        else:
+            messages[0]["content"] = [
+                {
+                    "type": "text",
+                    "text": context_msg,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
     tool_call_count = 0
+    api_call_count = 0
+    # Accumulate usage across tool-call loops within this cycle
+    cycle_usage: dict[str, int] = {}
 
     try:
         while True:
@@ -780,6 +1139,12 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 messages=messages,
                 tools=TOOL_DEFINITIONS,
             )
+            api_call_count += 1
+
+            # ── Log token usage ─────────────────────────────────
+            usage = log_usage("run_cycle", response, extra={"cycle": cycle_num})
+            for k, v in usage.items():
+                cycle_usage[k] = cycle_usage.get(k, 0) + v
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
@@ -788,14 +1153,14 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                     b.text for b in response.content if b.type == "text"
                 )
                 print(f"\n[Orchestrator] Decision complete: {final_text[:200]}...")
+                if cycle_usage:
+                    print(f"  [Tokens] {format_cycle_stats(cycle_usage)}")
 
                 _render_progress_safely("cycle completion")
 
                 # Update session memory
                 _update_session(cycle_num, tool_call_count, p2_result)
 
-                # ── Phase 3: Review trigger ─────────────────────────
-                _cycle_since_last_review += 1
                 review_requested = False
                 # Reflection is scheduled by main.py. Keeping the review
                 # trigger there avoids double-running reviews in the same
@@ -805,12 +1170,15 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 return {
                     "cycle": cycle_num,
                     "tool_calls": tool_call_count,
+                    "api_calls": api_call_count,
                     "elapsed": round(elapsed, 2),
                     "error": False,
                     "activity_mode": p2_result["activity_mode"],
                     "replan_requested": p2_result["replan_requested"],
                     "review_requested": review_requested,
                     "safe_mode": _safe_mode,
+                    "token_usage": cycle_usage,
+                    "forced_l1_reason": forced_l1_reason,
                 }
 
             # Execute ALL tool calls, then loop back to API
@@ -850,19 +1218,21 @@ def run_cycle(wake_change: dict | None = None) -> dict:
         import traceback
         traceback.print_exc()
 
-        _cycle_since_last_review += 1
         _render_progress_safely("cycle error")
 
         elapsed = time.time() - cycle_start
         return {
             "cycle": cycle_num,
             "tool_calls": tool_call_count,
+            "api_calls": api_call_count,
             "elapsed": round(elapsed, 2),
             "error": True,
             "error_message": str(e),
             "activity_mode": p2_result["activity_mode"],
             "review_requested": False,
             "safe_mode": _safe_mode,
+            "token_usage": cycle_usage,
+            "forced_l1_reason": forced_l1_reason,
         }
 
 
@@ -896,28 +1266,40 @@ def _update_session(cycle_num: int, tool_count: int, p2_result: dict) -> None:
     memory_mgr.write_session(content)
 
 
+# ── API timeout (seconds) ──────────────────────────────────────────────
+_API_TIMEOUT = int(os.environ.get("AURA_API_TIMEOUT", "300"))
+
+
 def _call_api_with_retry(
     client: anthropic.Anthropic,
     system: str,
     messages: list,
     tools: list,
 ) -> Any:
-    """Call the Claude API with exponential backoff retry."""
+    """Call the Claude API with timeout, logging, and exponential backoff."""
     last_error = None
     for attempt in range(API_RETRY_COUNT):
         try:
-            return client.messages.create(
+            t0 = time.time()
+            print(f"  [API] Calling {ANTHROPIC_MODEL} (attempt {attempt + 1}/{API_RETRY_COUNT}, timeout {_API_TIMEOUT}s)...")
+            result = client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=ANTHROPIC_MAX_TOKENS,
                 system=system,
                 messages=messages,
                 tools=tools,
+                timeout=_API_TIMEOUT,
             )
+            elapsed = time.time() - t0
+            print(f"  [API] Done in {elapsed:.1f}s")
+            return result
         except Exception as e:
             last_error = e
+            elapsed = time.time() - t0
+            print(f"  [API] Failed in {elapsed:.1f}s: {e}")
             if attempt < API_RETRY_COUNT - 1:
                 delay = API_RETRY_BASE_DELAY * (2 ** attempt)
-                print(f"  [Retry] Attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+                print(f"  [Retry] Attempt {attempt + 1} failed. Retrying in {delay}s...")
                 time.sleep(delay)
             else:
                 print(f"  [Retry] All {API_RETRY_COUNT} attempts failed.")

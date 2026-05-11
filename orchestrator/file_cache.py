@@ -78,9 +78,23 @@ def cached_read_file(path: str, encoding: str = "utf-8") -> Optional[str]:
     return content
 
 
-def _read_file_direct(path: str, encoding: str = "utf-8") -> Optional[str]:
-    """Direct file read without caching."""
+_MAX_FILE_READ_BYTES = 50 * 1024 * 1024  # 50 MB safety cap
+
+
+def _read_file_direct(path: str, encoding: str = "utf-8", max_bytes: int = _MAX_FILE_READ_BYTES) -> Optional[str]:
+    """Direct file read without caching. Capped at max_bytes to prevent OOM."""
     try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+
+    try:
+        if size is not None and size > max_bytes:
+            # Stream the tail portion — this is a safety fallback
+            with open(path, "rb") as f:
+                f.seek(size - min(size, max_bytes))
+                raw = f.read(min(size, max_bytes))
+            return raw.decode(encoding, errors="replace")
         with open(path, "r", encoding=encoding) as f:
             return f.read()
     except (OSError, UnicodeDecodeError):

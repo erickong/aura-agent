@@ -18,6 +18,7 @@ Override with: aura --data-dir=/path/to/dir start --task-file=...
 """
 
 import argparse
+import faulthandler
 import hashlib
 import json
 import os
@@ -255,7 +256,7 @@ _select_task_data_dir_before_import()
 
 from orchestrator.config import (
     CYCLE_INTERVAL_SECONDS,
-    DEEP_REVIEW_INTERVAL_CYCLES,
+    DEEP_REFLECTION_INTERVAL_MINUTES,
     LLM_DEAD_THROTTLE_SECONDS,
     ANTHROPIC_API_KEY,
     ANTHROPIC_BASE_URL,
@@ -272,7 +273,6 @@ from orchestrator.config import (
     STATE_DIR,
     PROJECTS_DIR,
     PROJECT_ROOT as CFG_PROJECT_ROOT,
-    REVIEW_NUDGE_INTERVAL,
     TASK_SUMMARY_ENABLED,
     WAKEUP_FILE,
     WORKER_CUDA_VISIBLE_DEVICES,
@@ -289,12 +289,15 @@ from orchestrator.config import (
     WORKER_RESOURCE_POLL_SECONDS,
     WORKER_RESOURCE_VIOLATION_STRIKES,
     get_workspace_dir,
+    AURA_SKIP_HEALTHY_CYCLES,
+    AURA_MAX_SKIPPED_CYCLES,
+    AURA_EXPLICIT_PROMPT_CACHE,
 )
 from orchestrator import state as state_mgr
 from orchestrator import memory as memory_mgr
 from orchestrator import progress as progress_mgr
 from orchestrator import process_mgr
-from orchestrator.agent import run_cycle
+from orchestrator.agent import run_cycle, should_skip_l1_cycle
 from orchestrator.changelog import (
     get_file_change_info,
     mark_file_processed,
@@ -306,6 +309,7 @@ from orchestrator.changelog import (
 from orchestrator.agent_patches import apply_patches, get_startup_banner
 from orchestrator.cli_extensions import register_commands
 from orchestrator.task_reporter import generate_task_summary
+from orchestrator.token_tracker import accumulate_session, format_session_display
 
 # -- Resilient review import --
 _review_available = False
@@ -330,6 +334,10 @@ ACTIVE_PROJECT_FILE = os.path.join(STATE_DIR, ".active_project")
 # -- Cycle tracking --
 _consecutive_api_errors = 0
 _llm_dead = False
+# Deep reflection: track when the current process started and when the last
+# deep reflection ran (persisted in state.json). Both must be > 2h old before
+# a deep reflection replaces a normal wake cycle.
+_process_start_time: float = 0.0
 
 
 class ShutdownRequested(KeyboardInterrupt):
@@ -570,11 +578,12 @@ def _print_effective_config() -> None:
     print(f"  Default task budget: {DEFAULT_TASK_BUDGET_MINUTES} min")
     print(f"  Max worker turns: {DEFAULT_MAX_TURNS}")
     print(f"  Wake interval: {CYCLE_INTERVAL_SECONDS}s")
-    print(f"  Deep review interval: every {DEEP_REVIEW_INTERVAL_CYCLES} cycles")
-    print(f"  Light review interval: every {REVIEW_NUDGE_INTERVAL} cycles")
+    print(f"  Deep reflection: every {DEEP_REFLECTION_INTERVAL_MINUTES} min (~{DEEP_REFLECTION_INTERVAL_MINUTES // 60}h, independent of wake cycles)")
     print(f"  LLM dead throttle: {LLM_DEAD_THROTTLE_SECONDS}s")
     print(f"  File cache: {_format_bool(FILE_CACHE_ENABLED)} (TTL {FILE_CACHE_TTL_SECONDS}s)")
     print(f"  Task summaries: {_format_bool(TASK_SUMMARY_ENABLED)}")
+    print(f"  Skip healthy cycles: {_format_bool(AURA_SKIP_HEALTHY_CYCLES)} (max {AURA_MAX_SKIPPED_CYCLES} consecutive)")
+    print(f"  Explicit prompt cache: {_format_bool(AURA_EXPLICIT_PROMPT_CACHE)}")
     print(f"  Resource guard: {_format_bool(WORKER_RESOURCE_GUARD_ENABLED)}")
     print(f"  Resource poll interval: {WORKER_RESOURCE_POLL_SECONDS}s")
     print(f"  Resource average window: {WORKER_RESOURCE_AVG_WINDOW_SECONDS}s")
@@ -588,6 +597,78 @@ def _print_effective_config() -> None:
     print(f"  Absolute GPU memory limit: {WORKER_MAX_GPU_MEMORY_GB}GB (0 disables)")
     print(f"  Minimum free GPU memory: {WORKER_MIN_GPU_MEMORY_FREE_GB}GB (0 disables)")
     print(f"  CUDA_VISIBLE_DEVICES for workers: {cuda_devices}")
+
+
+def _reconcile_stopped_workers() -> dict:
+    """Check for stopped/killed Layer 2 workers and update task status.
+
+    Returns structured events so callers can decide which categories
+    justify expensive follow-up actions (e.g. deep review).
+
+    MUST be called BEFORE run_cycle() so L1 sees up-to-date state.
+    """
+    events: dict[str, list[str]] = {
+        "changed": False,
+        "completed": [],
+        "failed": [],
+        "resource_stopped": [],
+    }
+    tracked = process_mgr.list_all()
+    for worker in tracked:
+        if worker["running"]:
+            continue
+
+        task_id = worker["task_id"]
+        entry = process_mgr._active_processes.get(task_id, {})
+        if entry.get("killed_at"):
+            if _handle_resource_guard_stop(task_id, entry):
+                events["changed"] = True
+                events["resource_stopped"].append(task_id)
+            # Remove from active registry so dead workers don't
+            # accumulate in context across long runs.
+            process_mgr._active_processes.pop(task_id, None)
+            continue
+
+        elapsed = worker["elapsed_minutes"]
+        output_size = worker["output_size"]
+
+        if output_size > 0:
+            print(f"\n  [DONE] Worker {task_id} finished (PID {worker['pid']}). "
+                  f"Output: {output_size} bytes. Marking completed.")
+            try:
+                state_mgr.update_task(task_id, "completed",
+                    f"Worker finished. Output: {output_size} bytes.",
+                    f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
+                events["changed"] = True
+                events["completed"].append(task_id)
+                try:
+                    generate_task_summary(task_id, "completed",
+                        f"Worker finished. Output: {output_size} bytes.",
+                        f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
+                except Exception:
+                    pass
+            except Exception as state_err:
+                print(f"    [WARN] Could not update task: {state_err}")
+        else:
+            print(f"\n  [CRASH] Worker {task_id} (PID {worker['pid']}) died with NO output.")
+            try:
+                state_mgr.update_task(task_id, "failed",
+                    f"Worker died after {elapsed}min with no output.", "(no output)")
+                events["changed"] = True
+                events["failed"].append(task_id)
+                try:
+                    generate_task_summary(task_id, "failed",
+                        f"Worker died after {elapsed}min with no output.", "(no output)")
+                except Exception:
+                    pass
+            except Exception as state_err:
+                print(f"    [WARN] Could not update task: {state_err}")
+
+        # Remove from active registry — state history is in decision_log
+        # and task tree, not in the process registry.
+        process_mgr._active_processes.pop(task_id, None)
+
+    return events
 
 
 def _handle_resource_guard_stop(task_id: str, entry: dict) -> bool:
@@ -692,10 +773,79 @@ def _handle_resource_guard_stop(task_id: str, entry: dict) -> bool:
     return True
 
 
+def _should_run_deep_reflection() -> bool:
+    """Return True if the current wake cycle should be replaced by a deep reflection.
+
+    Requires BOTH:
+      - Current process has been running > DEEP_REFLECTION_INTERVAL_MINUTES.
+      - Last deep review was > DEEP_REFLECTION_INTERVAL_MINUTES ago (or never).
+
+    This prevents deep reflection from firing on a fresh restart just because
+    the previous run's last review was long ago.
+    """
+    if _process_start_time == 0.0:
+        return False
+    elapsed_minutes = (time.time() - _process_start_time) / 60.0
+    if elapsed_minutes < DEEP_REFLECTION_INTERVAL_MINUTES:
+        return False
+    state = state_mgr.load_state()
+    last_review_str = state.get("last_deep_review_time", "")
+    if last_review_str:
+        try:
+            last_review_dt = datetime.fromisoformat(last_review_str)
+            since_last = (datetime.now() - last_review_dt).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            since_last = float("inf")
+        if since_last < DEEP_REFLECTION_INTERVAL_MINUTES:
+            return False
+    return True
+
+
+def _run_deep_reflection_cycle() -> dict:
+    """Run a deep reflection cycle, replacing a normal wake cycle."""
+    cycle_num = state_mgr.log_cycle()
+    print(f"\n{'='*60}")
+    print(f"  Aura Agent — Cycle #{cycle_num} [DEEP REFLECTION]")
+    print(f"  Wake at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+    print(f"  (replaces normal wake cycle — last deep review was "
+          f">{DEEP_REFLECTION_INTERVAL_MINUTES} min ago or never)")
+
+    if not _review_available:
+        print(f"  (Review engine not loaded: {_review_import_error})")
+        return {"cycle": cycle_num, "review_ran": False, "error": _review_import_error}
+
+    try:
+        review_result = review_cycle(force=True)
+        if review_result.get("error"):
+            print(f"  Review error: {review_result['error']}")
+        elif review_result.get("recommendations"):
+            print(f"  Recommendations:")
+            for r in review_result["recommendations"]:
+                print(f"    - {r}")
+    except Exception as review_err:
+        print(f"  Review engine failed: {review_err}")
+        review_result = {"error": str(review_err)}
+
+    # Persist the timestamp so we don't re-trigger on the next cycle
+    state = state_mgr.load_state()
+    state["last_deep_review_time"] = datetime.now().isoformat()
+    state_mgr.save_state(state)
+
+    return {"cycle": cycle_num, "review_ran": True, **review_result}
+
+
 def cmd_start(args):
     """Start the orchestrator main loop."""
+    # ── Crash diagnostics: dump traceback on SIGSEGV/SIGABRT/etc ──
+    crash_log = os.path.join(DATA_DIR, "crash.log")
+    try:
+        faulthandler.enable(file=open(crash_log, "a", buffering=1))
+    except Exception:
+        pass  # Best-effort only
+
     print(get_startup_banner())
-    global _running, _shutdown_requested, _consecutive_api_errors, _llm_dead
+    global _running, _shutdown_requested, _consecutive_api_errors, _llm_dead, _process_start_time
 
     task_file = args.task_file
     task_file_path = _resolve_task_file(task_file)
@@ -804,7 +954,7 @@ def cmd_start(args):
     interval = CYCLE_INTERVAL_SECONDS
     print(f"\n{'='*60}")
     print(f"  Main loop - wake every {interval}s ({interval // 60} min)")
-    print(f"  Deep review every {DEEP_REVIEW_INTERVAL_CYCLES} cycles (~{DEEP_REVIEW_INTERVAL_CYCLES * interval // 3600}h)")
+    print(f"  Deep reflection every {DEEP_REFLECTION_INTERVAL_MINUTES} min (~{DEEP_REFLECTION_INTERVAL_MINUTES // 60}h, independent of wake cycles)")
     print(f"  Press Ctrl+C to stop")
     print(f"{'='*60}\n")
 
@@ -824,6 +974,7 @@ def cmd_start(args):
     signal.signal(signal.SIGTERM, signal_handler)
 
     cycle_count = 0
+    _process_start_time = time.time()
     # R7: Save the initial task-file snapshot for later wake-time diffs.
     save_task_file_snapshot(task_file_path, PROJECTS_DIR, project_name)
 
@@ -866,6 +1017,43 @@ def cmd_start(args):
                 )
                 _render_progress_safely("changed task file reconcile")
 
+            # ── Reconcile stopped workers BEFORE run_cycle ────────────
+            # This ensures L1 sees correct task statuses (completed/failed)
+            # and the skip gate has accurate running/pending counts.
+            worker_events = _reconcile_stopped_workers()
+            if worker_events["changed"]:
+                worker_status_changed = True
+                _render_progress_safely("worker reconciliation")
+
+            # ── Deep reflection: replaces normal wake cycle when due ──
+            if _should_run_deep_reflection():
+                if not _review_available:
+                    print(f"\n  [DEEP REFLECTION] Scheduled but review engine unavailable: {_review_import_error}")
+                    print(f"  [DEEP REFLECTION] Skipping — running normal wake cycle instead.")
+                    # Persist timestamp so we don't retry every cycle
+                    state = state_mgr.load_state()
+                    state["last_deep_review_time"] = datetime.now().isoformat()
+                    state_mgr.save_state(state)
+                    # Fall through to normal run_cycle below
+                else:
+                    result = _run_deep_reflection_cycle()
+                    cycle_count += 1
+                    # Status line
+                    print(f"  [Cycle #{cycle_count} | deep reflection | mode: {result.get('activity_mode', 'review')}]")
+                    # Session token tracking
+                    review_usage = result.get("token_usage", {})
+                    accumulate_session(cycle_count, review_usage, "deep_reflection")
+                    print(format_session_display(review_usage, "deep_reflection"))
+                    _render_progress_safely("deep reflection")
+                    if not _running:
+                        break
+                    try:
+                        _save_project(project_name)
+                    except Exception as save_err:
+                        print(f"  [WARN] Project save failed: {save_err}")
+                    _sleep_until_next_wake(interval)
+                    continue
+
             result = run_cycle(wake_change=wake_change)
             cycle_count += 1
             actual_cycle = result.get("cycle", cycle_count)
@@ -891,94 +1079,27 @@ def cmd_start(args):
             else:
                 _consecutive_api_errors = 0
 
-            # -- Layer 2 crash detection --
-            tracked = process_mgr.list_all()
-            for worker in tracked:
-                if not worker["running"]:
-                    task_id = worker["task_id"]
-                    entry = process_mgr._active_processes.get(task_id, {})
-                    if entry.get("killed_at"):
-                        if _handle_resource_guard_stop(task_id, entry):
-                            worker_status_changed = True
-                        continue
-
-                    elapsed = worker["elapsed_minutes"]
-                    output_size = worker["output_size"]
-
-                    # If worker produced substantial output, it likely completed successfully
-                    if output_size > 0:
-                        print(f"\n  [DONE] Worker {task_id} finished (PID {worker['pid']}). "
-                              f"Output: {output_size} bytes. Marking completed.")
-                        try:
-                            state_mgr.update_task(task_id, "completed",
-                                f"Worker finished. Output: {output_size} bytes.",
-                                f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
-                            worker_status_changed = True
-                            try:
-                                generate_task_summary(task_id, "completed",
-                                    f"Worker finished. Output: {output_size} bytes.",
-                                    f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
-                            except Exception:
-                                pass
-                        except Exception as state_err:
-                            print(f"    [WARN] Could not update task: {state_err}")
-                    else:
-                        # No output = genuine failure
-                        print(f"\n  [CRASH] Worker {task_id} (PID {worker['pid']}) died with NO output.")
-                        try:
-                            state_mgr.update_task(task_id, "failed",
-                                f"Worker died after {elapsed}min with no output.", "(no output)")
-                            worker_status_changed = True
-                            try:
-                                generate_task_summary(task_id, "failed",
-                                    f"Worker died after {elapsed}min with no output.", "(no output)")
-                            except Exception:
-                                pass
-                        except Exception as state_err:
-                            print(f"    [WARN] Could not update task: {state_err}")
-
-                    process_mgr._active_processes[task_id]["killed_at"] = datetime.now().isoformat()
-                    process_mgr._active_processes[task_id]["running"] = False
-
-            # -- Hourly deep review --
             if worker_status_changed:
                 _render_progress_safely("worker status update")
 
-            if actual_cycle % DEEP_REVIEW_INTERVAL_CYCLES == 0:
-                print(f"\n  {'-'*50}")
-                print(f"  [DEEP REVIEW] Scheduled deep review (Cycle #{actual_cycle})")
-                print(f"  {'-'*50}")
-
-                if _review_available:
-                    try:
-                        review_result = review_cycle(force=True)
-                        if review_result.get("error"):
-                            print(f"  Review error: {review_result['error']}")
-                        elif review_result.get("recommendations"):
-                            print(f"  Recommendations:")
-                            for r in review_result["recommendations"]:
-                                print(f"    - {r}")
-                    except Exception as review_err:
-                        print(f"  Review engine failed: {review_err}")
-                else:
-                    print(f"  (Review engine not loaded: {_review_import_error})")
-
-            # -- Periodic light review (every REVIEW_NUDGE_INTERVAL) --
-            elif _review_available and actual_cycle % REVIEW_NUDGE_INTERVAL == 0:
-                try:
-                    review_cycle(force=False)
-                except Exception:
-                    pass  # Silent fail for light reviews
-
             # -- Status line --
             status_parts = [f"Cycle #{cycle_count}"]
-            if result.get("tool_calls", 0) > 0:
+            if result.get("skipped"):
+                status_parts.append(f"skipped: {result.get('skip_reason', '?')}")
+            elif result.get("tool_calls", 0) > 0:
                 status_parts.append(f"{result['tool_calls']} tool calls")
             if result.get("activity_mode"):
                 status_parts.append(f"mode: {result['activity_mode']}")
             if _llm_dead:
                 status_parts.append("BRAIN DEAD")
             print(f"  [{' | '.join(status_parts)}]")
+
+            # Session token tracking
+            usage = result.get("token_usage", {})
+            skipped = result.get("skipped", False)
+            accumulate_session(cycle_count, usage, "normal", skipped=skipped)
+            if not skipped:
+                print(format_session_display(usage, "normal"))
 
             # R7: If the task file changed, save a new snapshot for next diff.
             if wake_change.get("mtime_changed"):
@@ -1277,7 +1398,7 @@ def main():
     known_commands = {
         "start", "restart", "status", "progress", "projects", "history", "changelog",
         "cleanup", "wake", "setup", "summaries", "cache-stats",
-        "changelog-overview", "clean-workspaces",
+        "changelog-overview", "clean-workspaces", "token-stats",
     }
     option_takes_value = {"--config", "-c", "--data-dir"}
     skip_next = False

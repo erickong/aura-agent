@@ -32,6 +32,7 @@ from .config import (
 )
 from . import state as state_mgr
 from . import memory as memory_mgr
+from .token_tracker import log_usage, format_cycle_stats, extract_usage
 
 
 _REVIEW_SYSTEM_PROMPT = """You are Aura Agent's Reflection Engine — an independent reviewer that analyzes the agent's own performance.
@@ -153,32 +154,45 @@ def review_cycle(force: bool = False) -> dict:
 
     messages = [{"role": "user", "content": context}]
 
+    _API_TIMEOUT = int(os.environ.get("AURA_API_TIMEOUT", "300"))
+
     review_text = ""
+    review_usage = {}
     for attempt in range(API_RETRY_COUNT):
         try:
+            t0 = time.time()
+            print(f"  [Review] Calling {ANTHROPIC_MODEL} (attempt {attempt + 1}/{API_RETRY_COUNT}, timeout {_API_TIMEOUT}s)...")
             response = client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=min(ANTHROPIC_MAX_TOKENS, 2048),
                 system=_REVIEW_SYSTEM_PROMPT,
                 messages=messages,
+                timeout=_API_TIMEOUT,
             )
+            elapsed = time.time() - t0
+            print(f"  [Review] Done in {elapsed:.1f}s")
             review_text = "".join(
                 block.text for block in response.content
                 if block.type == "text"
             )
+            review_usage = extract_usage(response)
+            log_usage("review_cycle", response)
             break
         except Exception as e:
+            elapsed = time.time() - t0
+            print(f"  [Review] Failed in {elapsed:.1f}s: {e}")
             if attempt < API_RETRY_COUNT - 1:
                 delay = API_RETRY_BASE_DELAY * (2 ** attempt)
-                print(f"  [Review] Retry {attempt + 1}: {e}. Waiting {delay}s...")
+                print(f"  [Review] Retry {attempt + 1} failed. Waiting {delay}s...")
                 time.sleep(delay)
             else:
-                print(f"  [Review] All retries failed: {e}")
+                print(f"  [Review] All {API_RETRY_COUNT} attempts failed.")
                 return {
                     "review_text": f"ERROR: Review failed after {API_RETRY_COUNT} attempts: {e}",
                     "saved_path": "",
                     "recommendations": [],
                     "error": str(e),
+                    "token_usage": {},
                 }
 
     # Save review to memory directory
@@ -211,6 +225,7 @@ def review_cycle(force: bool = False) -> dict:
         "saved_path": review_path,
         "recommendations": recommendations,
         "error": None,
+        "token_usage": review_usage,
     }
 
 
@@ -314,6 +329,7 @@ Produce only the compressed memory (no preamble, no explanation)."""
                 block.text for block in response.content
                 if block.type == "text"
             )
+            log_usage("compress_memory", response)
             break
         except Exception as e:
             if attempt < API_RETRY_COUNT - 1:
@@ -383,12 +399,14 @@ def _derive_skill_name(task_id: str, result_text: str) -> str:
 def _build_skill_content(task_id: str, result_text: str) -> str:
     """Build skill markdown content from task result.
 
-    Uses Claude API to extract meaningful patterns (methods, tools,
-    decisions, pitfalls). Falls back to heuristic extraction on failure.
+    Uses heuristic extraction first (free). Only calls Claude API for
+    high-value candidates where the heuristic found promising signals.
     """
-    patterns_text = _extract_patterns_via_claude(task_id, result_text)
-    if not patterns_text:
-        patterns_text = _extract_patterns_heuristic(result_text)
+    patterns_text = _extract_patterns_heuristic(result_text)
+    if _is_high_value_skill_candidate(result_text, patterns_text):
+        claude_result = _extract_patterns_via_claude(task_id, result_text)
+        if claude_result:
+            patterns_text = claude_result
 
     return f"""# Skill: {task_id}
 
@@ -448,14 +466,31 @@ Output ONLY the extracted patterns in concise markdown bullet points. Be specifi
             block.text for block in response.content
             if block.type == "text"
         )
+        log_usage("extract_skill", response, extra={"task_id": task_id})
         return extracted.strip()
     except Exception as e:
         print(f"  [Skill] Claude extraction failed for {task_id}: {e}")
         return ""
 
 
+def _is_high_value_skill_candidate(result_text: str, heuristic_text: str) -> bool:
+    """Decide whether a task result justifies a Claude API call for skill extraction.
+
+    Returns True when the heuristic found multiple pattern signals AND the
+    result text is substantial enough that LLM extraction would add value.
+    """
+    if len(result_text) < 200:
+        return False
+    if len(heuristic_text) < 80:
+        return False
+    # Count distinct pattern signals
+    signal_keywords = ["pattern", "lesson", "approach", "method", "tool", "decision", "fix", "bug"]
+    signal_count = sum(1 for kw in signal_keywords if kw in heuristic_text.lower())
+    return signal_count >= 2
+
+
 def _extract_patterns_heuristic(result_text: str) -> str:
-    """Heuristic fallback for pattern extraction when Claude API is unavailable."""
+    """Heuristic extraction of patterns from task result (no API call)."""
     lines = result_text.split("\n")
     summary_lines = []
     for line in lines:

@@ -831,8 +831,70 @@ def _collect_in_progress(tasks: list) -> list[dict]:
     return result
 
 
+def get_task_tree_structure() -> str:
+    """Get a stable task tree structure without status icons or status text.
+
+    Only includes IDs, parent/child relationships, descriptions, and
+    acceptance criteria — everything that changes rarely. This goes into
+    the stable prefix for better prompt cache reuse.
+    """
+    state = load_state()
+    return _render_tree_structure(state["tasks"])
+
+
+def get_task_tree_status() -> str:
+    """Get dynamic task status only — status, latest decision, evidence.
+
+    This changes every cycle and belongs in the dynamic delta section.
+    """
+    state = load_state()
+    return _render_tree_status(state["tasks"])
+
+
+def _render_tree_structure(tasks: list, indent: int = 0) -> str:
+    """Render task tree structure only (IDs, descriptions, acceptance criteria)."""
+    lines = []
+    for task in tasks:
+        desc = task.get("description", "")[:100]
+        acceptance = task.get("acceptance_criteria", "")
+        line = f"{'  ' * indent}[{task['id']}] {desc}"
+        lines.append(line)
+        if acceptance:
+            lines.append(f"{'  ' * (indent + 1)}acceptance: {acceptance[:120]}")
+        if "children" in task and task["children"]:
+            lines.append(_render_tree_structure(task["children"], indent + 1))
+    return "\n".join(lines)
+
+
+def _render_tree_status(tasks: list, indent: int = 0) -> str:
+    """Render task tree status only (status, decisions, evidence)."""
+    lines = []
+    status_icons = {
+        "pending": "[ ]",
+        "in_progress": "[>]",
+        "blocked": "[!]",
+        "completed": "[x]",
+        "failed": "[X]",
+        "archived": "[.]",
+        "killed": "[K]",
+    }
+    for task in tasks:
+        icon = status_icons.get(task.get("status", "pending"), "[?]")
+        evidence = task.get("evidence", "")
+        reason = task.get("reason", "")
+        line = f"{'  ' * indent}{icon} [{task['id']}] {task.get('status', 'pending')}"
+        if reason:
+            line += f" — {reason[:100]}"
+        lines.append(line)
+        if evidence:
+            lines.append(f"{'  ' * (indent + 1)}evidence: {evidence[:120]}")
+        if "children" in task and task["children"]:
+            lines.append(_render_tree_status(task["children"], indent + 1))
+    return "\n".join(lines)
+
+
 def _render_tree(tasks: list, indent: int = 0) -> str:
-    """Render the task tree as indented text."""
+    """Render the task tree as indented text (full — structure + status)."""
     lines = []
     status_icons = {
         "pending": "⏳",

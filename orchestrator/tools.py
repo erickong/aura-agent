@@ -25,13 +25,34 @@ MIN_EXECUTABLE_TASK_DEPTH = 2
 TOOL_DEFINITIONS = [
     {
         "name": "read_file",
-        "description": "Read the contents of a file. Use this to inspect current-task state, progress, memory, or task outputs before making decisions. Other .aura task directories are isolated except their memory files.",
+        "description": "Read the contents of a file. Use mode='tail' for logs/outputs, 'head' for configs, or specify line ranges. Default max_chars is 2000 (not 8000).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read, relative to project root."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return. Default 2000.",
+                    "default": 2000
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "head", "tail", "full"],
+                    "description": "Read mode: auto (head+tail), head, tail, full.",
+                    "default": "auto"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-indexed start line for range reads. 0 = from start.",
+                    "default": 0
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-indexed end line (inclusive). 0 = to end.",
+                    "default": 0
                 }
             },
             "required": ["path"]
@@ -333,18 +354,223 @@ def _other_aura_task_path_error(path: str, operation: str) -> str | None:
     )
 
 
-def impl_read_file(path: str) -> str:
-    """Read a file and return its contents (mtime-cached)."""
+# ── Safety cap: max bytes to read for non-tail modes ──────────────────
+_MAX_FILE_READ_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _read_file_tail_from_disk(abs_path: str, max_chars: int) -> tuple[str | None, int, str]:
+    """Read only the tail of a file without loading everything into memory.
+
+    Returns (text, total_size_bytes, error_reason) — text is None on error.
+    """
+    try:
+        total_size = os.path.getsize(abs_path)
+    except OSError as e:
+        return None, 0, str(e)
+
+    if total_size == 0:
+        return "", 0, ""
+
+    # Read last N bytes (4x max_chars for multi-byte encoding headroom)
+    read_size = min(total_size, max(8192, max_chars * 4))
+    try:
+        with open(abs_path, "rb") as f:
+            f.seek(total_size - read_size)
+            raw = f.read(read_size)
+    except OSError as e:
+        return None, 0, str(e)
+
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text, total_size, ""
+
+
+def _read_file_head_from_disk(abs_path: str, max_chars: int) -> tuple[str | None, int, str]:
+    """Read only the head of a file without loading everything into memory."""
+    try:
+        total_size = os.path.getsize(abs_path)
+    except OSError as e:
+        return None, 0, str(e)
+
+    if total_size == 0:
+        return "", 0, ""
+
+    # Read first N bytes (4x max_chars for encoding headroom)
+    read_size = min(total_size, max(8192, max_chars * 4))
+    try:
+        with open(abs_path, "rb") as f:
+            raw = f.read(read_size)
+    except OSError as e:
+        return None, 0, str(e)
+
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text, total_size, ""
+
+
+def _check_output_jsonl_guard(abs_path: str) -> str | None:
+    """Intercept reads of output.jsonl in task workspace directories.
+
+    The orchestrator should read result.md for task outcomes and trust
+    Phase 2 progress signals for active workers. Raw output.jsonl is
+    for worker-level debugging, not orchestrator decision-making.
+
+    Returns an advisory message string if the read should be blocked,
+    or None if the read is allowed to proceed.
+    """
+    workspace_dir = os.path.normpath(get_workspace_dir())
+    tasks_dir = os.path.normpath(os.path.join(workspace_dir, "tasks"))
+    norm_path = os.path.normpath(abs_path)
+
+    # Only intercept files directly under a task workspace directory
+    if not norm_path.startswith(tasks_dir + os.sep):
+        return None
+
+    # Must be output.jsonl or output.txt
+    fname = os.path.basename(norm_path)
+    if fname not in {"output.jsonl", "output.txt"}:
+        return None
+
+    # Extract task_id from path: <tasks_dir>/<task_id>/output.jsonl
+    rel = os.path.relpath(norm_path, tasks_dir)
+    parts = rel.split(os.sep)
+    if len(parts) < 2:
+        return None
+    task_id = parts[0]
+
+    # Check if result.md exists for this task
+    result_path = os.path.join(tasks_dir, task_id, "result.md")
+    if os.path.exists(result_path):
+        try:
+            result_size = os.path.getsize(result_path)
+        except OSError:
+            result_size = 0
+        return (
+            f"BLOCKED: This task has result.md ({result_size} bytes). "
+            f"Read result.md instead — it contains the definitive outcome "
+            f"and is 300x smaller than output.jsonl. "
+            f"Path: .aura/workspace/tasks/{task_id}/result.md"
+        )
+
+    # No result.md — worker is still running. Trust Phase 2 signals.
+    return (
+        f"BLOCKED: No result.md yet for {task_id}. This worker's progress "
+        f"is tracked by Phase 2 signals (output_delta, content_changed, "
+        f"active_score, cpu_percent) in the workspace digest. "
+        f"Only read output.jsonl if the digest shows **STUCK** or **LOOPING**."
+    )
+
+
+def impl_read_file(path: str, max_chars: int = 2000, mode: str = "auto",
+                   start_line: int = 0, end_line: int = 0) -> str:
+    """Read a file and return its contents.
+
+    Tail and head modes stream only the needed portion from disk.
+    Full and auto modes use the mtime cache but cap reads at 50 MB.
+
+    Args:
+        path: File path relative to project root.
+        max_chars: Maximum characters to return. Default 2000.
+        mode: 'auto' (head+tail for large files), 'head', 'tail', 'full'.
+        start_line: If > 0, start reading from this 1-indexed line.
+        end_line: If > 0, stop reading at this 1-indexed line (inclusive).
+    """
     error = _other_aura_task_path_error(path, "read")
     if error:
         return error
     abs_path = _resolve_path(path)
+
+    # ── Guard: intercept output.jsonl reads for task workspaces ─────
+    # The orchestrator LLM should read result.md for outcomes and trust
+    # Phase 2 signals for progress. Raw output.jsonl is 300x larger and
+    # rarely contains information the LLM needs for decision-making.
+    _guard = _check_output_jsonl_guard(abs_path)
+    if _guard:
+        return _guard
+
+    # ── tail mode: stream from disk, no full-file load ──────────────
+    if mode == "tail" and start_line <= 0 and end_line <= 0:
+        text, total_size, err = _read_file_tail_from_disk(abs_path, max_chars)
+        if text is None:
+            return f"ERROR reading file: {path} ({err})"
+        if not text:
+            return f"File: {path} (empty)"
+        return (
+            f"File: {path} ({total_size} chars, tail {max_chars}):\n\n"
+            + (f"... [first {total_size - max_chars} chars omitted] ...\n"
+               if total_size > max_chars else "")
+            + text
+        )
+
+    # ── head mode: stream from disk, no full-file load ─────────────
+    if mode == "head" and start_line <= 0 and end_line <= 0:
+        text, total_size, err = _read_file_head_from_disk(abs_path, max_chars)
+        if text is None:
+            return f"ERROR reading file: {path} ({err})"
+        if not text:
+            return f"File: {path} (empty)"
+        if total_size <= max_chars:
+            return f"File: {path} ({total_size} chars, full):\n\n{text}"
+        return (
+            f"File: {path} ({total_size} chars, head {max_chars}):\n\n"
+            + text
+            + f"\n... [{total_size - max_chars} more chars]"
+        )
+
+    # ── All other modes: cached read with size cap ─────────────────
     content = cached_read_file(abs_path)
     if content is None:
         return f"ERROR: File not found: {path}"
-    if len(content) > 8000:
-        content = content[:8000] + "\n... [TRUNCATED - file too long]"
-    return content
+
+    total_chars = len(content)
+
+    # Line-range mode (needs full content for line indexing)
+    if start_line > 0 or end_line > 0:
+        if start_line <= 0:
+            start_line = 1
+        lines = content.splitlines(True)
+        if start_line > len(lines):
+            return f"ERROR: start_line {start_line} exceeds file length ({len(lines)} lines)"
+        if end_line == 0:
+            end_line = len(lines)
+        selected = "".join(lines[start_line - 1:end_line])
+        if len(selected) > max_chars:
+            selected = selected[:max_chars] + (
+                f"\n... [truncated {len(selected) - max_chars} chars from line range]"
+            )
+        return (
+            f"File: {path} ({total_chars} chars, {len(lines)} lines, "
+            f"lines {start_line}-{min(end_line, len(lines))}):\n\n{selected}"
+        )
+
+    # Mode "full" — return the complete file (capped for safety)
+    if mode == "full":
+        if len(content) > max_chars:
+            return (
+                f"File: {path} ({total_chars} chars) — full read requested but "
+                f"capped at {max_chars} chars. Use a higher max_chars or "
+                f"line-range mode for the rest.\n\n"
+                + content[:max_chars]
+                + f"\n... [{total_chars - max_chars} more chars]"
+            )
+        return f"File: {path} ({total_chars} chars, full):\n\n{content}"
+
+    # Small file → return full
+    if len(content) <= max_chars:
+        return content
+
+    # Default: auto mode — show head + tail for large files
+    head_size = max_chars // 2
+    tail_size = max_chars - head_size
+    omitted = total_chars - max_chars
+    return (
+        f"File: {path} ({total_chars} chars, head+tail {max_chars}):\n\n"
+        + content[:head_size]
+        + f"\n... [{omitted} chars omitted] ...\n"
+        + content[-tail_size:]
+    )
 
 
 def impl_write_file(path: str, content: str) -> str:

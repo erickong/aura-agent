@@ -22,6 +22,8 @@ from .config import (
 # Keyed by task_id. Tracks both the last hash and the last N lines so we can
 # detect looping even when the hash changes (same lines cycling).
 _last_tail_state: dict[str, dict] = {}
+# Track artifacts from previous cycle so we can report truly new ones
+_last_artifacts: dict[str, set] = {}
 
 
 def _read_tail_lines(output_path: str, n: int = 40) -> list[str]:
@@ -182,6 +184,8 @@ def evaluate_progress(
         "is_stuck": False,
         "stuck_cycles": 0,
         "artifacts": [],
+        "new_artifacts": [],
+        "cpu_percent": process_cpu,
         "error_log_size": 0,
         "is_looping": False,
         "tail_analysis": {},
@@ -229,6 +233,12 @@ def evaluate_progress(
     except OSError:
         pass
 
+    # Compute new artifacts (files not seen in previous cycle)
+    current_artifacts = set(result["artifacts"])
+    prev_artifacts = _last_artifacts.get(task_id, set())
+    result["new_artifacts"] = sorted(current_artifacts - prev_artifacts)
+    _last_artifacts[task_id] = current_artifacts
+
     # ── Composite active_score ───────────────────────────────────────
     score = 0.0
     if result["has_output"]:
@@ -264,10 +274,10 @@ def evaluate_progress(
     # computation — NOT stuck, just slow to report.
     size_stagnant = (result["output_delta"] == 0 and result["output_size"] == previous_output_size)
     content_stagnant = not result["content_changed"]
-    no_artifacts = not result["artifacts"]
+    no_new_artifacts = not result["new_artifacts"]
     cpu_idle = process_cpu < 0.5  # Less than 0.5% CPU = effectively idle
 
-    if size_stagnant and content_stagnant and no_artifacts and cpu_idle:
+    if size_stagnant and content_stagnant and no_new_artifacts and cpu_idle:
         result["is_stuck"] = True
 
     return result

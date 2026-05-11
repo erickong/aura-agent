@@ -96,6 +96,34 @@ def cmd_setup(args, config_ns):
     val = input(f"File Read Cache (1=on, 0=off) [{default_cache}]: ").strip()
     config["AURA_FILE_CACHE"] = val or default_cache
 
+    print()
+    print("--- Token Pricing (USD per 1M tokens) ---")
+    default_hit = os.environ.get("AURA_TOKEN_PRICE_CACHE_HIT", "0.145")
+    val = input(f"Cache Hit Price [$/{default_hit}M]: ").strip()
+    config["AURA_TOKEN_PRICE_CACHE_HIT"] = val or default_hit
+
+    default_miss = os.environ.get("AURA_TOKEN_PRICE_CACHE_MISS", "1.74")
+    val = input(f"Cache Miss (Input) Price [$/{default_miss}M]: ").strip()
+    config["AURA_TOKEN_PRICE_CACHE_MISS"] = val or default_miss
+
+    default_out = os.environ.get("AURA_TOKEN_PRICE_OUTPUT", "1.74")
+    val = input(f"Output Price [$/{default_out}M]: ").strip()
+    config["AURA_TOKEN_PRICE_OUTPUT"] = val or default_out
+
+    print()
+    print("--- Tool Call Budget (prompt guidance, not hard limits) ---")
+    default_normal = os.environ.get("AURA_TOOL_CALL_BUDGET_NORMAL", "12")
+    val = input(f"Normal cycle max tool calls [{default_normal}]: ").strip()
+    config["AURA_TOOL_CALL_BUDGET_NORMAL"] = val or default_normal
+
+    default_diag = os.environ.get("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40")
+    val = input(f"Diagnostic cycle max tool calls [{default_diag}]: ").strip()
+    config["AURA_TOOL_CALL_BUDGET_DIAGNOSTIC"] = val or default_diag
+
+    default_plan = os.environ.get("AURA_TOOL_CALL_BUDGET_PLANNING", "40")
+    val = input(f"Planning cycle max tool calls [{default_plan}]: ").strip()
+    config["AURA_TOOL_CALL_BUDGET_PLANNING"] = val or default_plan
+
     lines = ["# Aura Agent Configuration",
              f"# Generated: {datetime.now().isoformat()}", ""]
     for key, value in config.items():
@@ -238,6 +266,21 @@ def cmd_cache_stats(args, config_ns):
         print(f"  {key}: {value}")
 
 
+def cmd_token_stats(args, config_ns):
+    """Show token usage and cache hit statistics."""
+    from orchestrator.token_tracker import get_stats, format_stats, get_skip_count
+    stats = get_stats()
+    print(format_stats(stats))
+    skips = get_skip_count()
+    if skips > 0:
+        print(f"\n  Skipped L1 cycles: {skips}")
+    if stats["total_calls"] > 0:
+        print(f"\n  Avg tokens/call: {stats['total_input_tokens'] // stats['total_calls']:,} in "
+              f"+ {stats['total_output_tokens'] // stats['total_calls']:,} out")
+        print(f"  Total estimated cost: ${stats['estimated_cost']:.4f}")
+        print(f"  Estimated savings:    ${stats['estimated_cost_saved']:.4f}")
+
+
 def register_commands(subparsers):
     """Register all new CLI subcommands on an existing subparsers object."""
 
@@ -275,3 +318,7 @@ def register_commands(subparsers):
     p_cache = subparsers.add_parser("cache-stats",
         help="Show file read cache statistics (R4)")
     p_cache.set_defaults(func=cmd_cache_stats)
+
+    p_tokens = subparsers.add_parser("token-stats",
+        help="Show token usage and cache hit statistics")
+    p_tokens.set_defaults(func=cmd_token_stats)

@@ -36,7 +36,9 @@ def _project_name_from_task_file(task_file: str) -> str:
 
     与 orchestrator/main.py 中的同名函数保持完全一致。
     """
-    name = os.path.splitext(os.path.basename(task_file))[0]
+    # Normalize backslashes to forward slashes for cross-platform consistency
+    normalized = task_file.replace("\\", "/")
+    name = os.path.splitext(os.path.basename(normalized))[0]
     return name.replace(" ", "_").lower()
 
 
@@ -51,7 +53,8 @@ def get_changelog_path(projects_dir: str, project_name: str, task_file: str) -> 
     使用 task_file 的 basename（不含路径）作为 changelog 文件名，
     这样即使 task_file 路径格式不同（正反斜杠），也能对应到同一个 changelog。
     """
-    basename = os.path.basename(task_file)
+    normalized = task_file.replace("\\", "/")
+    basename = os.path.basename(normalized)
     if not basename.endswith(".json"):
         basename = os.path.splitext(basename)[0] + ".json"
     return os.path.join(get_changelog_dir(projects_dir, project_name), basename)
@@ -288,7 +291,8 @@ def cleanup_orphan_projects(projects_dir: str, active_task_files: list[str]) -> 
 def get_task_file_snapshot_path(projects_dir: str, project_name: str,
                                  task_file: str) -> str:
     """Path to the stored snapshot of the task file (for diff comparison)."""
-    basename = os.path.basename(task_file)
+    normalized = task_file.replace("\\", "/")
+    basename = os.path.basename(normalized)
     snapshot_name = os.path.splitext(basename)[0] + ".snapshot.md"
     return os.path.join(get_changelog_dir(projects_dir, project_name), snapshot_name)
 
