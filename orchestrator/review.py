@@ -17,12 +17,13 @@ from typing import Optional
 import anthropic
 
 from .config import (
-    ANTHROPIC_API_KEY,
-    ANTHROPIC_BASE_URL,
-    ANTHROPIC_MODEL,
-    ANTHROPIC_MAX_TOKENS,
+    AURA_API_KEY,
+    AURA_API_BASE_URL,
+    AURA_API_MODEL,
+    AURA_API_MAX_TOKENS,
     API_RETRY_COUNT,
     API_RETRY_BASE_DELAY,
+    API_TIMEOUT_SECONDS,
     LONG_TERM_MEMORY_MAX_CHARS,
     MEMORY_DIR,
     SKILLS_DIR,
@@ -148,23 +149,24 @@ def review_cycle(force: bool = False) -> dict:
     context = build_review_context()
 
     client = anthropic.Anthropic(
-        base_url=ANTHROPIC_BASE_URL,
-        api_key=ANTHROPIC_API_KEY,
+        base_url=AURA_API_BASE_URL,
+        api_key=AURA_API_KEY,
+        auth_token=AURA_API_KEY,
     )
 
     messages = [{"role": "user", "content": context}]
 
-    _API_TIMEOUT = int(os.environ.get("AURA_API_TIMEOUT", "300"))
+    _API_TIMEOUT = API_TIMEOUT_SECONDS
 
     review_text = ""
     review_usage = {}
     for attempt in range(API_RETRY_COUNT):
         try:
             t0 = time.time()
-            print(f"  [Review] Calling {ANTHROPIC_MODEL}...")
+            print(f"  [Review] Calling {AURA_API_MODEL}...")
             response = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=min(ANTHROPIC_MAX_TOKENS, 2048),
+                model=AURA_API_MODEL,
+                max_tokens=min(AURA_API_MAX_TOKENS, 2048),
                 system=_REVIEW_SYSTEM_PROMPT,
                 messages=messages,
                 timeout=_API_TIMEOUT,
@@ -295,8 +297,9 @@ def compress_memory(force: bool = False) -> dict:
 
     # Use Claude API to compress
     client = anthropic.Anthropic(
-        base_url=ANTHROPIC_BASE_URL,
-        api_key=ANTHROPIC_API_KEY,
+        base_url=AURA_API_BASE_URL,
+        api_key=AURA_API_KEY,
+        auth_token=AURA_API_KEY,
     )
 
     compress_prompt = f"""You are a memory compression engine. Condense the following long-term memory into a structured summary.
@@ -320,8 +323,8 @@ Produce only the compressed memory (no preamble, no explanation)."""
     for attempt in range(API_RETRY_COUNT):
         try:
             response = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=min(ANTHROPIC_MAX_TOKENS, 4096),
+                model=AURA_API_MODEL,
+                max_tokens=min(AURA_API_MAX_TOKENS, 4096),
                 system="You are a memory compression engine. Output ONLY the compressed memory text.",
                 messages=[{"role": "user", "content": compress_prompt}],
             )
@@ -453,12 +456,13 @@ Output ONLY the extracted patterns in concise markdown bullet points. Be specifi
 
     try:
         client = anthropic.Anthropic(
-            base_url=ANTHROPIC_BASE_URL,
-            api_key=ANTHROPIC_API_KEY,
+            base_url=AURA_API_BASE_URL,
+            api_key=AURA_API_KEY,
+            auth_token=AURA_API_KEY,
         )
         response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=min(ANTHROPIC_MAX_TOKENS, 1024),
+            model=AURA_API_MODEL,
+            max_tokens=min(AURA_API_MAX_TOKENS, 1024),
             system="You are a pattern extraction engine. Output ONLY the extracted patterns as markdown bullet points.",
             messages=[{"role": "user", "content": skill_prompt}],
         )

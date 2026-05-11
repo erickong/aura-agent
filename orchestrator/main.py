@@ -32,23 +32,97 @@ from pathlib import Path
 
 CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.getcwd())
-os.environ.setdefault("AURA_PROJECT_ROOT", PROJECT_ROOT)
 sys.path.insert(0, CODE_ROOT)
 
+# ── Early override parsing (before config import) ─────────────────────
+# These will be set on orchestrator.config module before its first import.
+# This is how overrides flow WITHOUT touching os.environ.
+_config_file_override: str | None = None
+_data_dir_override: str | None = None
 
 # -- Early --data-dir parsing (before config import) --
-_data_dir = None
 _args_for_data = sys.argv[1:]
 for i, arg in enumerate(_args_for_data):
     if arg in ("--data-dir",) and i + 1 < len(_args_for_data):
-        _data_dir = _args_for_data[i + 1]
+        _data_dir_override = os.path.expanduser(_args_for_data[i + 1])
         break
     elif arg.startswith("--data-dir="):
-        _data_dir = arg.split("=", 1)[1]
+        _data_dir_override = os.path.expanduser(arg.split("=", 1)[1])
         break
 
-if _data_dir:
-    os.environ["AURA_DATA_DIR"] = os.path.expanduser(_data_dir)
+
+def _is_setup_command(argv: list[str]) -> bool:
+    """Detect 'setup' subcommand without importing config."""
+    return any(arg == "setup" for arg in argv)
+
+
+def _is_help_flag(argv: list[str]) -> bool:
+    """Detect --help/-h flag without importing config."""
+    return any(arg in ("--help", "-h") for arg in argv)
+
+
+def _run_setup_without_config(argv: list[str]) -> None:
+    """Run the setup wizard WITHOUT loading orchestrator.config.
+
+    This is the critical path for new users: if no config file exists,
+    'aura setup' must still work so they can create one.
+    """
+    import argparse as _argparse
+    from orchestrator.cli_extensions import cmd_setup
+
+    _parser = _argparse.ArgumentParser(description="Aura Agent setup")
+    _parser.add_argument("setup", nargs="?")
+    _parser.add_argument("--output", "-o", default=None)
+    _parser.add_argument("--force", "-f", action="store_true")
+    _args, _ = _parser.parse_known_args(argv)
+
+    cmd_setup(_args, None)
+    sys.exit(0)
+
+
+def _run_help_without_config(argv: list[str]) -> None:
+    """Show help WITHOUT loading orchestrator.config."""
+    print("Aura Agent - Autonomous Task Orchestrator")
+    print()
+    print("Usage:")
+    print("  aura setup              Run first-time configuration wizard")
+    print("  aura start --task-file=FILE   Start orchestrator for a task")
+    print("  aura status             Show current project status")
+    print("  aura progress           Generate progress report")
+    print("  aura projects           List saved projects")
+    print("  aura history            Show decision history")
+    print("  aura changelog          Show task-file changelog")
+    print("  aura wake               Signal the orchestrator to wake up")
+    print("  aura cleanup            Clean orphan projects")
+    print()
+    print("Options:")
+    print("  --config, -c PATH       Path to .env config file")
+    print("  --data-dir PATH         Data directory override")
+    print("  --help, -h              Show this help")
+    print()
+    print(f"Config file (default): ~/.aura/config.env")
+    print("Run 'aura setup' to create your config file.")
+    sys.exit(0)
+
+
+# Resolve the config file path early (used for --help check below).
+_global_config_path = os.path.join(os.path.expanduser("~"), ".aura", "config.env")
+
+# Intercept setup and --help BEFORE config loading.
+# On a fresh install with no config file, these must work without
+# importing orchestrator.config (which raises FileNotFoundError).
+
+# Always intercept 'setup' — it never needs config.
+if _is_setup_command(sys.argv[1:]):
+    _run_setup_without_config(sys.argv[1:])
+
+# Intercept --help/-h only when there is no config file yet.
+# If a config file exists, let the normal argparse path handle
+# --help so users get subcommand-specific help text.
+if _is_help_flag(sys.argv[1:]):
+    _cfg_path_final = _config_file_override or _global_config_path
+    if not os.path.exists(os.path.expanduser(_cfg_path_final)):
+        _run_help_without_config(sys.argv[1:])
 
 
 def _early_resolve_task_file(task_file: str) -> str:
@@ -116,14 +190,15 @@ def _detect_task_arg(argv: list[str]) -> str | None:
 
 
 def _select_task_data_dir_before_import() -> None:
-    if _data_dir:
+    global _data_dir_override
+    if _data_dir_override:
         return
 
     base_dir = _default_aura_base_dir()
     task_arg = _detect_task_arg(sys.argv[1:])
     if task_arg:
         task_file = _early_resolve_task_file(task_arg)
-        os.environ["AURA_DATA_DIR"] = _task_data_dir_for(task_file, base_dir)
+        _data_dir_override = _task_data_dir_for(task_file, base_dir)
         return
 
     marker = _active_task_data_marker(base_dir)
@@ -131,13 +206,13 @@ def _select_task_data_dir_before_import() -> None:
         try:
             active_dir = Path(marker).read_text(encoding="utf-8").strip()
             if active_dir:
-                os.environ["AURA_DATA_DIR"] = active_dir
+                _data_dir_override = active_dir
         except OSError:
             pass
 
 
 def _record_task_data_dir(task_file: str, data_dir: str) -> None:
-    if _data_dir:
+    if _data_dir_override:
         return
 
     base_dir = _default_aura_base_dir()
@@ -181,49 +256,14 @@ def _record_task_data_dir(task_file: str, data_dir: str) -> None:
     Path(_active_task_data_marker(base_dir)).write_text(data_dir_abs, encoding="utf-8")
 
 
-_select_task_data_dir_before_import()
-
-
 # -- Early config loading (before config import) --
-GLOBAL_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".aura", "config.env")
-
-
-def _load_dotenv(env_path: str) -> None:
-    """Manually parse a .env file and set os.environ (no python-dotenv needed)."""
-    if not os.path.exists(env_path):
-        print(f"[WARN] Config file not found: {env_path}")
-        sys.exit(1)
-
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            # Skip empty lines and comments
-            if not line or line.startswith("#"):
-                continue
-            # Parse KEY=VALUE (handle optional quotes)
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            # Strip surrounding quotes if present
-            if (value.startswith('"') and value.endswith('"')) or \
-               (value.startswith("'") and value.endswith("'")):
-                value = value[1:-1]
-            os.environ[key] = value
-
-
-def _load_dotenv_if_exists(env_path: str) -> bool:
-    if not os.path.exists(env_path):
-        return False
-    _load_dotenv(env_path)
-    return True
-
+# Determine the config file path from --config / -c flags.
+# Then set orchestrator.config.CONFIG_FILE_PATH so config.py reads from it directly.
+GLOBAL_CONFIG_PATH = _global_config_path
 
 # Check for --config / -c early (before config module is imported).
 # Also removes these args from sys.argv so argparse doesn't choke on
 # --config appearing after the subcommand (e.g. "start --config=.env ...")
-_config_path = None
 _new_argv = [sys.argv[0]]
 _skip_next = False
 for i, arg in enumerate(sys.argv[1:], 1):
@@ -231,37 +271,59 @@ for i, arg in enumerate(sys.argv[1:], 1):
         _skip_next = False
         continue
     if arg in ("--config", "-c") and i + 1 < len(sys.argv):
-        _config_path = sys.argv[i + 1]
+        _config_file_override = os.path.abspath(sys.argv[i + 1])
         _skip_next = True
         continue
     elif arg.startswith("--config="):
-        _config_path = arg.split("=", 1)[1]
+        _config_file_override = os.path.abspath(arg.split("=", 1)[1])
         continue
     elif arg.startswith("-c="):
-        _config_path = arg.split("=", 1)[1]
+        _config_file_override = os.path.abspath(arg.split("=", 1)[1])
         continue
     _new_argv.append(arg)
 sys.argv = _new_argv
 
-if _config_path:
-    # Load global defaults first, then allow explicit --config to override.
-    _load_dotenv_if_exists(GLOBAL_CONFIG_PATH)
-    _load_dotenv(_config_path)
-    print(f"[CONFIG] Loaded environment from: {_config_path}")
-else:
-    _load_dotenv_if_exists(GLOBAL_CONFIG_PATH)
+# ── NOW load config module with overrides BEFORE its code runs ─────────
+# We use importlib.util.module_from_spec so we can set CONFIG_FILE_PATH,
+# DATA_DIR_OVERRIDE, and PROJECT_ROOT_OVERRIDE on the module object BEFORE
+# the module-level code executes. This replaces the old flow where config.env
+# was loaded into os.environ and config.py read from os.environ.
+import importlib.util as _importlib_util
+import sys as _sys
 
-_select_task_data_dir_before_import()
+# Skip if already configured (e.g., by test conftest)
+_existing_cfg = _sys.modules.get("orchestrator.config")
+if _existing_cfg is not None and getattr(_existing_cfg, "_config_data", None) is not None:
+    # Config already loaded from file — don't replace. Tests or embedded
+    # usage pre-configure the module before main.py is imported.
+    pass
+else:
+    # Determine data_dir BEFORE config module loads (so DATA_DIR_OVERRIDE is final)
+    _select_task_data_dir_before_import()
+
+    _cfg_spec = _importlib_util.find_spec("orchestrator.config")
+    _cfg_mod = _importlib_util.module_from_spec(_cfg_spec)
+
+    # Set overrides BEFORE module code runs
+    if _config_file_override:
+        _cfg_mod.CONFIG_FILE_PATH = _config_file_override
+        print(f"[CONFIG] Config file: {_config_file_override}")
+    if _data_dir_override:
+        _cfg_mod.DATA_DIR_OVERRIDE = _data_dir_override
+    _cfg_mod.PROJECT_ROOT_OVERRIDE = PROJECT_ROOT
+
+    _sys.modules["orchestrator.config"] = _cfg_mod
+    _cfg_spec.loader.exec_module(_cfg_mod)
 
 
 from orchestrator.config import (
     CYCLE_INTERVAL_SECONDS,
     DEEP_REFLECTION_INTERVAL_MINUTES,
     LLM_DEAD_THROTTLE_SECONDS,
-    ANTHROPIC_API_KEY,
-    ANTHROPIC_BASE_URL,
-    ANTHROPIC_MODEL,
-    ANTHROPIC_MAX_TOKENS,
+    AURA_API_KEY,
+    AURA_API_BASE_URL,
+    AURA_API_MODEL,
+    AURA_API_MAX_TOKENS,
     AURA_LAYER2_BACKEND,
     DATA_DIR,
     DEFAULT_MAX_TURNS,
@@ -564,15 +626,15 @@ def _format_bool(value: bool) -> str:
 
 def _print_effective_config() -> None:
     """Print startup configuration so defaults are visible at launch."""
-    key_state = "set" if ANTHROPIC_API_KEY else "missing"
+    key_state = "set" if AURA_API_KEY else "missing"
     cuda_devices = WORKER_CUDA_VISIBLE_DEVICES or "(all visible)"
     print()
     print("  Effective Configuration")
     print("  -----------------------")
-    print(f"  Layer 1 model: {ANTHROPIC_MODEL}")
-    print(f"  Layer 1 base URL: {ANTHROPIC_BASE_URL}")
+    print(f"  Layer 1 model: {AURA_API_MODEL}")
+    print(f"  Layer 1 base URL: {AURA_API_BASE_URL}")
     print(f"  API key: {key_state}")
-    print(f"  Max tokens: {ANTHROPIC_MAX_TOKENS}")
+    print(f"  Max tokens: {AURA_API_MAX_TOKENS}")
     print(f"  Layer 2 backend: {AURA_LAYER2_BACKEND}")
     print(f"  Max concurrent workers: {MAX_CONCURRENT_TASKS}")
     print(f"  Default task budget: {DEFAULT_TASK_BUDGET_MINUTES} min")
@@ -1470,9 +1532,9 @@ def main():
         if not args.task_file:
             parser.error("restart requires a task file, e.g. aura restart tasks/task.md")
 
-    # Apply --data-dir if passed via argparse (overrides early parse for edge cases)
-    if args.data_dir:
-        os.environ["AURA_DATA_DIR"] = os.path.expanduser(args.data_dir)
+    # Apply --data-dir if passed via argparse (already handled before config import)
+    # This is intentionally a no-op — DATA_DIR is set from config module attributes.
+    pass
 
     if not args.command:
         parser.print_help()

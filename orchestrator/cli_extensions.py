@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -34,6 +35,75 @@ def cmd_wake(args, config_ns):
         print("The orchestrator will wake on its next poll cycle.")
 
 
+_KNOWN_BASE_URLS = [
+    ("DeepSeek (Anthropic-compatible)", "https://api.deepseek.com/anthropic",
+     "deepseek-v4-pro[1m]", "recommended"),
+    ("Anthropic (Official)", "https://api.anthropic.com",
+     "claude-sonnet-4-6-20250514", ""),
+    ("Custom BaseUrl", "", "", ""),
+]
+
+
+def _detect_provider_from_url(url: str) -> str:
+    """Detect API provider type from the base URL. Called once at setup time."""
+    if not url:
+        return "unknown"
+    url_lower = url.lower()
+    if "deepseek" in url_lower:
+        return "deepseek"
+    if "anthropic" in url_lower:
+        return "anthropic"
+    if "openai" in url_lower:
+        return "openai"
+    return "anthropic"  # default: assume Anthropic-compatible
+
+
+def _test_api_connectivity(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
+    """Test whether the configured API is reachable with a minimal call."""
+    if not api_key or not base_url:
+        return False, "No API key or base URL configured"
+
+    masked = api_key[:8] + "****" + api_key[-4:] if len(api_key) > 12 else "****"
+    try:
+        import anthropic
+        client = anthropic.Anthropic(base_url=base_url, api_key=api_key, auth_token=api_key)
+        t0 = time.time()
+        response = client.messages.create(
+            model=model,
+            max_tokens=4,
+            system="Reply with just the word OK.",
+            messages=[{"role": "user", "content": "Say OK"}],
+            timeout=30,
+        )
+        elapsed = time.time() - t0
+        text = "".join(b.text for b in response.content if b.type == "text")
+        if "OK" in text:
+            return True, f"OK ({elapsed:.1f}s, key={masked})"
+        return True, f"Connected ({elapsed:.1f}s, key={masked})"
+    except Exception as e:
+        return False, f"key={masked} — {e}"
+
+
+def _parse_env_file(path: str) -> dict[str, str]:
+    """Parse a .env file and return a dict of key→value (no os.environ side effects)."""
+    config: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if (value.startswith('"') and value.endswith('"')) or \
+               (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            config[key] = value
+    return config
+
+
 def cmd_setup(args, config_ns):
     """R5: Interactive first-time configuration wizard."""
     print("=" * 60)
@@ -41,7 +111,7 @@ def cmd_setup(args, config_ns):
     print("=" * 60)
     print()
     print("This wizard will help you configure your Aura Agent.")
-    print("Press Enter to accept defaults, or type a new value.")
+    print("Press Enter to accept defaults.")
     print()
 
     env_path = os.path.abspath(os.path.expanduser(args.output or get_global_config_path()))
@@ -50,77 +120,129 @@ def cmd_setup(args, config_ns):
         print("Use --force to overwrite or --output for different path.")
         return
 
-    config = {}
+    # Read existing config file (if any) for defaults — never from os.environ
+    existing_config: dict[str, str] = {}
+    if os.path.exists(env_path):
+        try:
+            existing_config = _parse_env_file(env_path)
+        except (OSError, Exception):
+            pass
 
-    default_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    config: dict[str, str] = {}
+
+    # ── API Key (one key for all providers) ──────────────────────────
+    default_key = existing_config.get("AURA_API_KEY", "")
     masked = default_key[:8] + "***" if len(default_key) > 8 else "(not set)"
-    val = input(f"API Key [{masked}]: ").strip()
-    config["ANTHROPIC_API_KEY"] = val or default_key
+    print("─ API Key ──────────────────────────────────────────────────")
+    val = input(f"  API Key [{masked}]: ").strip()
+    config["AURA_API_KEY"] = val or default_key
+    print()
 
-    default_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
-    val = input(f"API Base URL [{default_url}]: ").strip()
-    config["ANTHROPIC_BASE_URL"] = val or default_url
+    # ── Base URL selection ───────────────────────────────────────────
+    print("─ API Provider ─────────────────────────────────────────────")
+    print("  Select the API provider and base URL:")
+    default_url = existing_config.get("AURA_API_BASE_URL", "https://api.deepseek.com/anthropic")
+    default_idx = 0
+    for i, (label, url, model, tag) in enumerate(_KNOWN_BASE_URLS):
+        tag_str = f" ({tag})" if tag else ""
+        marker = " →" if url == default_url else "  "
+        print(f"  {i + 1}. {label}{tag_str}")
+        if url:
+            print(f"     {marker} {url}")
+        else:
+            print(f"     {marker} (enter custom URL)")
+        if url == default_url:
+            default_idx = i
+    print()
+    val = input(f"  Choose provider [1-{len(_KNOWN_BASE_URLS)}] (default: {default_idx + 1}): ").strip()
 
-    default_model = os.environ.get("ANTHROPIC_MODEL", "deepseek-v4-pro[1m]")
-    val = input(f"Model [{default_model}]: ").strip()
-    config["ANTHROPIC_MODEL"] = val or default_model
+    try:
+        choice = int(val) - 1 if val else default_idx
+        if 0 <= choice < len(_KNOWN_BASE_URLS):
+            _, selected_url, default_model, _ = _KNOWN_BASE_URLS[choice]
+        else:
+            choice = default_idx
+            _, selected_url, default_model, _ = _KNOWN_BASE_URLS[default_idx]
+    except (ValueError, IndexError):
+        choice = default_idx
+        _, selected_url, default_model, _ = _KNOWN_BASE_URLS[default_idx]
 
-    default_tokens = os.environ.get("AURA_MAX_TOKENS", "4096")
+    if choice == len(_KNOWN_BASE_URLS) - 1 and not selected_url:
+        val = input("  Custom base URL: ").strip()
+        config["AURA_API_BASE_URL"] = val or ""
+    else:
+        val = input(f"  Base URL [{selected_url}]: ").strip()
+        config["AURA_API_BASE_URL"] = val or selected_url
+
+    # ── Detect and persist provider type ──────────────────────────────
+    final_url = config["AURA_API_BASE_URL"]
+    provider = _detect_provider_from_url(final_url)
+    config["AURA_API_PROVIDER"] = provider
+    print(f"  → Detected provider: {provider}")
+    print()
+
+    # ── Model ────────────────────────────────────────────────────────
+    current_model = existing_config.get("AURA_API_MODEL", default_model or "deepseek-v4-pro[1m]")
+    val = input(f"  Model [{current_model}]: ").strip()
+    config["AURA_API_MODEL"] = val or current_model
+    print()
+
+    default_tokens = existing_config.get("AURA_API_MAX_TOKENS", "4096")
     val = input(f"Max Tokens [{default_tokens}]: ").strip()
-    config["AURA_MAX_TOKENS"] = val or default_tokens
+    config["AURA_API_MAX_TOKENS"] = val or default_tokens
 
-    default_cycle = os.environ.get("AURA_CYCLE_INTERVAL", "300")
+    default_cycle = existing_config.get("AURA_CYCLE_INTERVAL", "300")
     val = input(f"Wake Interval (seconds) [{default_cycle}]: ").strip()
     config["AURA_CYCLE_INTERVAL"] = val or default_cycle
 
-    default_backend = os.environ.get("AURA_LAYER2_BACKEND", "claude_code")
-    val = input(f"Layer 2 Backend (claude_code/ds_code) [{default_backend}]: ").strip().lower()
-    if val not in ("claude_code", "ds_code", ""):
-        print("[WARN] Invalid backend. Using default: claude_code")
+    default_backend = existing_config.get("AURA_LAYER2_BACKEND", "claude")
+    val = input(f"Layer 2 Backend (claude/ds_code) [{default_backend}]: ").strip().lower()
+    if val not in ("claude", "ds_code", ""):
+        print("[WARN] Invalid backend. Using default: claude")
         val = ""
     config["AURA_LAYER2_BACKEND"] = val or default_backend
 
-    default_dscode_model = os.environ.get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
+    default_dscode_model = existing_config.get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
     val = input(f"ds-code Model [{default_dscode_model}]: ").strip()
     config["AURA_DSCODE_MODEL"] = val or default_dscode_model
 
-    default_budget = os.environ.get("AURA_TASK_BUDGET", "30")
+    default_budget = existing_config.get("AURA_TASK_BUDGET", "30")
     val = input(f"Default Task Budget (min) [{default_budget}]: ").strip()
     config["AURA_TASK_BUDGET"] = val or default_budget
 
-    default_turns = os.environ.get("AURA_MAX_TURNS", "50")
+    default_turns = existing_config.get("AURA_MAX_TURNS", "50")
     val = input(f"Max Turns per Task [{default_turns}]: ").strip()
     config["AURA_MAX_TURNS"] = val or default_turns
 
-    default_cache = os.environ.get("AURA_FILE_CACHE", "1")
+    default_cache = existing_config.get("AURA_FILE_CACHE", "1")
     val = input(f"File Read Cache (1=on, 0=off) [{default_cache}]: ").strip()
     config["AURA_FILE_CACHE"] = val or default_cache
 
     print()
     print("--- Token Pricing (USD per 1M tokens) ---")
-    default_hit = os.environ.get("AURA_TOKEN_PRICE_CACHE_HIT", "0.145")
+    default_hit = existing_config.get("AURA_TOKEN_PRICE_CACHE_HIT", "0.145")
     val = input(f"Cache Hit Price [$/{default_hit}M]: ").strip()
     config["AURA_TOKEN_PRICE_CACHE_HIT"] = val or default_hit
 
-    default_miss = os.environ.get("AURA_TOKEN_PRICE_CACHE_MISS", "1.74")
+    default_miss = existing_config.get("AURA_TOKEN_PRICE_CACHE_MISS", "1.74")
     val = input(f"Cache Miss (Input) Price [$/{default_miss}M]: ").strip()
     config["AURA_TOKEN_PRICE_CACHE_MISS"] = val or default_miss
 
-    default_out = os.environ.get("AURA_TOKEN_PRICE_OUTPUT", "1.74")
+    default_out = existing_config.get("AURA_TOKEN_PRICE_OUTPUT", "1.74")
     val = input(f"Output Price [$/{default_out}M]: ").strip()
     config["AURA_TOKEN_PRICE_OUTPUT"] = val or default_out
 
     print()
     print("--- Tool Call Budget (prompt guidance, not hard limits) ---")
-    default_normal = os.environ.get("AURA_TOOL_CALL_BUDGET_NORMAL", "12")
+    default_normal = existing_config.get("AURA_TOOL_CALL_BUDGET_NORMAL", "12")
     val = input(f"Normal cycle max tool calls [{default_normal}]: ").strip()
     config["AURA_TOOL_CALL_BUDGET_NORMAL"] = val or default_normal
 
-    default_diag = os.environ.get("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40")
+    default_diag = existing_config.get("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40")
     val = input(f"Diagnostic cycle max tool calls [{default_diag}]: ").strip()
     config["AURA_TOOL_CALL_BUDGET_DIAGNOSTIC"] = val or default_diag
 
-    default_plan = os.environ.get("AURA_TOOL_CALL_BUDGET_PLANNING", "40")
+    default_plan = existing_config.get("AURA_TOOL_CALL_BUDGET_PLANNING", "40")
     val = input(f"Planning cycle max tool calls [{default_plan}]: ").strip()
     config["AURA_TOOL_CALL_BUDGET_PLANNING"] = val or default_plan
 
@@ -137,9 +259,25 @@ def cmd_setup(args, config_ns):
 
     print()
     print(f"[OK] Configuration written to: {env_path}")
-    print("This is the default global config path. You can now run Aura from any project directory:")
+
+    # ── Connectivity test ────────────────────────────────────────────
+    api_key = config.get("AURA_API_KEY", "")
+    api_url = config.get("AURA_API_BASE_URL", "")
+    model = config.get("AURA_API_MODEL", "deepseek-v4-pro[1m]")
+    if api_key and api_url:
+        print()
+        print("  Testing API connectivity...")
+        ok, detail = _test_api_connectivity(api_url, api_key, model)
+        if ok:
+            print(f"  [OK] API connected — {detail}")
+        else:
+            print(f"  [WARN] API test failed — {detail}")
+            print("  Config saved, but please check your key, URL, and model.")
+
+    print()
+    print("You can now run Aura from any project directory:")
     print("  aura start --task-file=tasks/task.md")
-    print(f"To override it for one run, pass: aura --config={env_path} start --task-file=tasks/task.md")
+    print(f"To override config for one run: aura --config={env_path} start --task-file=tasks/task.md")
 
 
 def cmd_changelog(args, config_ns):

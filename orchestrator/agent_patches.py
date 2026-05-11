@@ -132,7 +132,7 @@ def apply_patches() -> dict:
     def patched_build_context(wake_change=None, p2_result=None) -> str:
         msg = original_build(wake_change=wake_change, p2_result=p2_result)
         msg += f"\n\n## Layer 2 Backend\n- Backend: {AURA_LAYER2_BACKEND}"
-        if AURA_LAYER2_BACKEND == "claude_code":
+        if AURA_LAYER2_BACKEND == "claude":
             msg += "\n- Workers run via Claude Code CLI (claude -p @task.md)"
         elif AURA_LAYER2_BACKEND == "ds_code":
             msg += "\n- Workers run via ds-code CLI (ds-code run)"
@@ -150,7 +150,7 @@ def apply_patches() -> dict:
 def get_startup_banner() -> str:
     """Return the startup banner showing Layer 2 backend info (R1)."""
     backend_display = {
-        "claude_code": "Claude Code CLI (Anthropic)",
+        "claude": "Claude Code CLI (Anthropic)",
         "ds_code": "ds-code CLI (DeepSeek)",
     }.get(AURA_LAYER2_BACKEND, AURA_LAYER2_BACKEND)
 

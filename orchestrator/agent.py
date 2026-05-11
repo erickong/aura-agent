@@ -23,12 +23,13 @@ from typing import Any
 import anthropic
 
 from .config import (
-    ANTHROPIC_API_KEY,
-    ANTHROPIC_BASE_URL,
-    ANTHROPIC_MODEL,
-    ANTHROPIC_MAX_TOKENS,
+    AURA_API_KEY,
+    AURA_API_BASE_URL,
+    AURA_API_MODEL,
+    AURA_API_MAX_TOKENS,
     API_RETRY_COUNT,
     API_RETRY_BASE_DELAY,
+    API_TIMEOUT_SECONDS,
     STUCK_THRESHOLD_CYCLES,
     get_workspace_dir,
     MEMORY_DIR,
@@ -1092,8 +1093,9 @@ def run_cycle(wake_change: dict | None = None) -> dict:
         ) + context_msg
 
     client = anthropic.Anthropic(
-        base_url=ANTHROPIC_BASE_URL,
-        api_key=ANTHROPIC_API_KEY,
+        base_url=AURA_API_BASE_URL,
+        api_key=AURA_API_KEY,
+        auth_token=AURA_API_KEY,
     )
 
     messages = [{"role": "user", "content": context_msg}]
@@ -1102,7 +1104,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
     # Split into stable prefix (cacheable) and dynamic delta to maximise
     # cache reuse across cycles. Only enabled for Anthropic native API
     # because DeepSeek may not support the cache_control field.
-    if AURA_EXPLICIT_PROMPT_CACHE and "api.anthropic.com" in ANTHROPIC_BASE_URL:
+    if AURA_EXPLICIT_PROMPT_CACHE and "api.anthropic.com" in AURA_API_BASE_URL:
         parts = context_msg.split("\n---\n", 1)
         if len(parts) == 2:
             stable_prefix, dynamic_delta = parts
@@ -1266,8 +1268,8 @@ def _update_session(cycle_num: int, tool_count: int, p2_result: dict) -> None:
     memory_mgr.write_session(content)
 
 
-# ── API timeout (seconds) ──────────────────────────────────────────────
-_API_TIMEOUT = int(os.environ.get("AURA_API_TIMEOUT", "300"))
+# ── API timeout (seconds) — from config file only ──────────────────────
+_API_TIMEOUT = API_TIMEOUT_SECONDS
 
 
 def _call_api_with_retry(
@@ -1281,10 +1283,10 @@ def _call_api_with_retry(
     for attempt in range(API_RETRY_COUNT):
         try:
             t0 = time.time()
-            print(f"  [API] Calling {ANTHROPIC_MODEL}...")
+            print(f"  [API] Calling {AURA_API_MODEL}...")
             result = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=ANTHROPIC_MAX_TOKENS,
+                model=AURA_API_MODEL,
+                max_tokens=AURA_API_MAX_TOKENS,
                 system=system,
                 messages=messages,
                 tools=tools,

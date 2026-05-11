@@ -35,6 +35,7 @@ from .config import (
     WORKER_CUDA_VISIBLE_DEVICES,
     AURA_LAYER2_BACKEND,
     AURA_CLAUDE_BIN,
+    AURA_API_KEY,
     AURA_DEEPSEEK_API_KEY,
     AURA_DSCODE_MAX_TURNS,
     AURA_DSCODE_MODEL,
@@ -702,8 +703,8 @@ def _wrap_windows_script_cmd(exe: str, args: list[str]) -> list[str]:
 def spawn(task_id: str, task_dir: str, task_md_path: str, budget_minutes: int) -> str:
     """Spawn a Layer 2 worker process for a task.
 
-    Dispatches to claude_code or ds_code backend based on
-    AURA_LAYER2_BACKEND config (default: claude_code).
+    Dispatches to claude or ds_code backend based on
+    AURA_LAYER2_BACKEND config (default: claude).
     """
     if AURA_LAYER2_BACKEND == "ds_code":
         return _spawn_dscode(task_id, task_dir, task_md_path, budget_minutes)
@@ -792,7 +793,7 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
         _ensure_resource_monitor()
 
         affinity_note = f" CPU affinity: {cpu_affinity}." if cpu_affinity else ""
-        return (f"OK: Task {task_id} started (PID: {proc.pid}, backend: claude_code). "
+        return (f"OK: Task {task_id} started (PID: {proc.pid}, backend: claude). "
                 f"Output: {task_dir}/output.jsonl "
                 f"Budget: {budget_minutes}min.{affinity_note} {preflight}")
 
@@ -843,8 +844,8 @@ def _spawn_dscode(task_id: str, task_dir: str, task_md_path: str, budget_minutes
     if AURA_DEEPSEEK_API_KEY:
         env["DEEPSEEK_API_KEY"] = AURA_DEEPSEEK_API_KEY
     elif not env.get("DEEPSEEK_API_KEY"):
-        # Fallback: reuse ANTHROPIC_API_KEY for the same DeepSeek endpoint
-        fallback = os.environ.get("ANTHROPIC_API_KEY", "")
+        # Fallback: reuse AURA_API_KEY for the same DeepSeek endpoint
+        fallback = AURA_API_KEY
         if fallback:
             env["DEEPSEEK_API_KEY"] = fallback
     if AURA_DSCODE_BASE_URL:

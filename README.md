@@ -58,7 +58,7 @@ Aura gives you:
 - Task-file change detection while the orchestrator is already running
 - External wake-up with `aura wake`
 - Local project checkpoints under `.aura/`
-- Support for both `claude_code` and `ds_code` worker backends
+- Support for both `claude` and `ds_code` worker backends
 
 ## How It Works
 
@@ -126,7 +126,7 @@ Requirements:
 - Python 3.10+
 - An Anthropic-compatible API endpoint for Layer 1, defaulting to DeepSeek's Anthropic-compatible endpoint
 - One Layer 2 backend:
-  - `claude_code`: Claude Code CLI available as `claude`
+  - `claude`: Claude Code CLI available as `claude`
   - `ds_code`: `ds-code` CLI available as `ds-code`
 
 Install locally:
@@ -201,13 +201,14 @@ Important environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | required | API key for the Layer 1 orchestrator model |
-| `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible API endpoint |
-| `ANTHROPIC_MODEL` | `deepseek-v4-pro[1m]` | Layer 1 model |
-| `AURA_LAYER2_BACKEND` | `claude_code` | `claude_code` or `ds_code` |
+| `AURA_API_KEY` | required | API key for the Layer 1 orchestrator model |
+| `AURA_API_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible API endpoint |
+| `AURA_API_MODEL` | `deepseek-v4-pro[1m]` | Layer 1 model |
+| `AURA_API_PROVIDER` | (auto-detected) | Provider type: deepseek / anthropic / openai |
+| `AURA_LAYER2_BACKEND` | `claude` | `claude` or `ds_code` |
 | `AURA_CYCLE_INTERVAL` | `300` | Wake interval in seconds |
 | `AURA_DEEP_REVIEW_INTERVAL` | `12` | Review interval in cycles |
-| `AURA_MAX_TOKENS` | `4096` | Max output tokens per Layer 1 API call |
+| `AURA_API_MAX_TOKENS` | `4096` | Max output tokens per Layer 1 API call |
 | `AURA_MAX_CONCURRENT_TASKS` | `2` | Max concurrent Layer 2 workers |
 | `AURA_TASK_BUDGET` | `30` | Default Layer 2 worker budget in minutes |
 | `AURA_MAX_TURNS` | `50` | Max turns for Claude Code workers |

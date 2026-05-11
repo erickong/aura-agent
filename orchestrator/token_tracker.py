@@ -33,16 +33,18 @@ def _get_prices():
 
 
 # Anthropic Claude pricing (fallback estimates — not configurable yet)
-ANTHROPIC_CACHE_WRITE_PRICE = 3.75  # per 1M tokens
-ANTHROPIC_CACHE_READ_PRICE = 0.30   # per 1M tokens
-ANTHROPIC_INPUT_PRICE = 15.0        # per 1M tokens
-ANTHROPIC_OUTPUT_PRICE = 75.0       # per 1M tokens
+_CLAUDE_CACHE_WRITE_PRICE = 3.75  # per 1M tokens
+_CLAUDE_CACHE_READ_PRICE = 0.30   # per 1M tokens
+_CLAUDE_INPUT_PRICE = 15.0        # per 1M tokens
+_CLAUDE_OUTPUT_PRICE = 75.0       # per 1M tokens
 
 # ── Storage ──────────────────────────────────────────────────────────
-_stats_path = os.path.join(
-    os.environ.get("AURA_DATA_DIR", os.path.join(os.getcwd(), ".aura")),
-    "token_stats.jsonl",
-)
+
+# Lazy path resolution — uses config.DATA_DIR after imports are ready.
+# _resolve_stats_path() is the canonical accessor; _stats_path is only
+# used as a fallback if config import fails (defensive).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_stats_path = ""
 
 # In-memory accumulator — populated from disk at first call, then kept in sync
 _usage_records: list[dict] = []
@@ -67,20 +69,28 @@ def _resolve_skip_path() -> str:
         return os.path.join(DATA_DIR, "skip_stats.json")
     except Exception:
         return os.path.join(
-            os.environ.get("AURA_DATA_DIR", os.path.join(os.getcwd(), ".aura")),
-            "skip_stats.json",
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", ".aura", "skip_stats.json",
         )
 
 
 def _detect_provider() -> str:
-    """Detect which provider is in use from the API base URL."""
+    """Return the API provider. Uses stored config value (set at setup time).
+    Falls back to URL inspection for backward compatibility."""
     try:
-        from .config import ANTHROPIC_BASE_URL
+        from .config import AURA_API_PROVIDER
+        if AURA_API_PROVIDER:
+            return AURA_API_PROVIDER
+    except Exception:
+        pass
+    # Fallback: inspect URL
+    try:
+        from .config import AURA_API_BASE_URL
     except Exception:
         return "unknown"
-    if "deepseek" in ANTHROPIC_BASE_URL.lower():
+    if "deepseek" in AURA_API_BASE_URL.lower():
         return "deepseek"
-    if "anthropic" in ANTHROPIC_BASE_URL.lower():
+    if "anthropic" in AURA_API_BASE_URL.lower():
         return "anthropic"
     return "unknown"
 
@@ -281,16 +291,16 @@ def get_stats() -> dict:
         total_cache = total_cache_hit
     else:
         estimated_cost = (
-            (total_cache_read / 1_000_000) * ANTHROPIC_CACHE_READ_PRICE
-            + (total_cache_creation / 1_000_000) * ANTHROPIC_CACHE_WRITE_PRICE
-            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * ANTHROPIC_INPUT_PRICE
-            + (total_output / 1_000_000) * ANTHROPIC_OUTPUT_PRICE
+            (total_cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
+            + (total_cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
+            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
+            + (total_output / 1_000_000) * _CLAUDE_OUTPUT_PRICE
         )
-        full_input_cost = (total_input / 1_000_000) * ANTHROPIC_INPUT_PRICE
+        full_input_cost = (total_input / 1_000_000) * _CLAUDE_INPUT_PRICE
         estimated_saved = full_input_cost - (
-            (total_cache_read / 1_000_000) * ANTHROPIC_CACHE_READ_PRICE
-            + (total_cache_creation / 1_000_000) * ANTHROPIC_CACHE_WRITE_PRICE
-            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * ANTHROPIC_INPUT_PRICE
+            (total_cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
+            + (total_cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
+            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
         )
         total_cache = total_cache_read
 
@@ -424,9 +434,9 @@ def format_cycle_stats(usage: dict) -> str:
         )
     elif provider == "anthropic" and hit:
         cost = (
-            (hit / 1_000_000) * ANTHROPIC_CACHE_READ_PRICE
-            + (usage.get("cache_creation_input_tokens", 0) / 1_000_000) * ANTHROPIC_CACHE_WRITE_PRICE
-            + (out / 1_000_000) * ANTHROPIC_OUTPUT_PRICE
+            (hit / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
+            + (usage.get("cache_creation_input_tokens", 0) / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
+            + (out / 1_000_000) * _CLAUDE_OUTPUT_PRICE
         )
         return (
             f"tokens: in={inp:,} out={out:,} | "
@@ -526,10 +536,10 @@ def get_session_stats() -> dict:
             total_cache_hit += cache_read
             total_cache_miss += cache_creation
             cost = (
-                (cache_read / 1_000_000) * ANTHROPIC_CACHE_READ_PRICE
-                + (cache_creation / 1_000_000) * ANTHROPIC_CACHE_WRITE_PRICE
-                + (max(0, inp - cache_read - cache_creation) / 1_000_000) * ANTHROPIC_INPUT_PRICE
-                + (out / 1_000_000) * ANTHROPIC_OUTPUT_PRICE
+                (cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
+                + (cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
+                + (max(0, inp - cache_read - cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
+                + (out / 1_000_000) * _CLAUDE_OUTPUT_PRICE
             )
 
         total_cost += cost
@@ -593,10 +603,10 @@ def format_session_display(current_usage: dict | None = None,
             cache_read = current_usage.get("cache_read_input_tokens", 0)
             cache_creation = current_usage.get("cache_creation_input_tokens", 0)
             current_cost = (
-                (cache_read / 1_000_000) * ANTHROPIC_CACHE_READ_PRICE
-                + (cache_creation / 1_000_000) * ANTHROPIC_CACHE_WRITE_PRICE
-                + (max(0, inp_cur - cache_read - cache_creation) / 1_000_000) * ANTHROPIC_INPUT_PRICE
-                + (out_cur / 1_000_000) * ANTHROPIC_OUTPUT_PRICE
+                (cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
+                + (cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
+                + (max(0, inp_cur - cache_read - cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
+                + (out_cur / 1_000_000) * _CLAUDE_OUTPUT_PRICE
             )
         else:
             current_cost = (inp_cur / 1_000_000) * cache_miss_price + (out_cur / 1_000_000) * output_price

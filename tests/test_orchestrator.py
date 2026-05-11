@@ -25,9 +25,14 @@ import pytest
 CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, CODE_ROOT)
 
-# Set required env vars before importing orchestrator modules
-os.environ["ANTHROPIC_API_KEY"] = "test-key-1234"
-os.environ["AURA_PROJECT_ROOT"] = os.path.join(tempfile.gettempdir(), "aura_test_project")
+# All config comes from the test config file (see conftest.py).
+# os.environ is NOT used for Aura config values.
+
+
+def _get_project_root():
+    """Return PROJECT_ROOT from the test-loaded config module."""
+    from orchestrator.config import PROJECT_ROOT
+    return PROJECT_ROOT
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Fixtures
@@ -114,13 +119,9 @@ def task_file_minimal(temp_project):
 
 @pytest.fixture
 def patched_config(temp_project):
-    """Patch orchestrator config paths to use a temp directory."""
-    aura_dir = str(temp_project / ".aura")
-    with patch.dict(os.environ, {
-        "AURA_DATA_DIR": aura_dir,
-        "AURA_PROJECT_ROOT": str(temp_project),
-    }):
-        yield aura_dir
+    """Return the Aura data directory path (config already loaded from test file)."""
+    from orchestrator.config import DATA_DIR
+    return DATA_DIR
 
 
 @pytest.fixture
@@ -146,7 +147,7 @@ class TestFreshStart:
         from orchestrator import state as state_mgr
         from orchestrator.config import STATE_DIR
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "hello.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "hello.md")
         state = state_mgr.init_state("Build a web app", task_file)
 
         assert state["mission"] == "Build a web app"
@@ -270,7 +271,7 @@ class TestFreshStart:
     def test_load_and_save_state_roundtrip(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         state_mgr.init_state("Roundtrip test", task_file)
 
         loaded = state_mgr.load_state()
@@ -281,7 +282,7 @@ class TestFreshStart:
         from orchestrator import state as state_mgr
         from orchestrator.config import STATE_DIR
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         state = state_mgr.init_state("Backup test", task_file)
 
         bak_path = os.path.join(STATE_DIR, "state.json.bak")
@@ -294,7 +295,7 @@ class TestFreshStart:
         from orchestrator import state as state_mgr
         from orchestrator.config import STATE_DIR
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         state_mgr.init_state("Recovery test", task_file)
 
         # Corrupt primary state.json
@@ -409,7 +410,7 @@ class TestChangingRequirements:
     def test_batch_prefix_advances_on_file_change(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         # Create the file
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
         Path(task_file).write_text("# Initial\n", encoding="utf-8")
@@ -432,7 +433,7 @@ class TestChangingRequirements:
     def test_batch_prefix_advances_multiple_times(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
 
         Path(task_file).write_text("# V1\n", encoding="utf-8")
@@ -456,7 +457,7 @@ class TestChangingRequirements:
     def test_batch_prefix_after_z_goes_to_aa(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
 
         Path(task_file).write_text("# V1\n", encoding="utf-8")
@@ -478,7 +479,7 @@ class TestChangingRequirements:
     def test_no_batch_advance_without_change(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
 
         Path(task_file).write_text("# V1\n", encoding="utf-8")
@@ -617,16 +618,14 @@ class TestSameNameDifferentPaths:
         assert name2 == "app_b"
 
     def test_resolve_task_file(self, temp_project):
-        # _resolve_task_file uses CFG_PROJECT_ROOT from config (set via env var).
-        # Patch env, reload config and main to pick up the new path.
-        with patch.dict(os.environ, {"AURA_PROJECT_ROOT": str(temp_project)}):
-            import importlib
-            import orchestrator.config as cfg
-            import orchestrator.main as main_mod
+        import orchestrator.config as cfg
+        import orchestrator.main as main_mod
 
-            cfg = importlib.reload(cfg)
-            main_mod = importlib.reload(main_mod)
-
+        _orig_project_root = cfg.PROJECT_ROOT
+        _orig_cfg_project_root = main_mod.CFG_PROJECT_ROOT
+        cfg.PROJECT_ROOT = str(temp_project)
+        main_mod.CFG_PROJECT_ROOT = str(temp_project)
+        try:
             # Relative path
             resolved = main_mod._resolve_task_file("tasks/my_task.md")
             assert resolved == os.path.normpath(str(temp_project / "tasks" / "my_task.md"))
@@ -635,47 +634,62 @@ class TestSameNameDifferentPaths:
             abs_path = str(temp_project / "tasks" / "absolute.md")
             resolved = main_mod._resolve_task_file(abs_path)
             assert resolved == os.path.normpath(abs_path)
+        finally:
+            cfg.PROJECT_ROOT = _orig_project_root
+            main_mod.CFG_PROJECT_ROOT = _orig_cfg_project_root
 
     def test_record_task_data_dir_creates_metadata(self, temp_project, task_file_simple):
+        import orchestrator.main as main_mod
         from orchestrator.main import _record_task_data_dir, _default_aura_base_dir, _task_data_dir_for
 
-        base_dir = _default_aura_base_dir()
-        data_dir = _task_data_dir_for(str(task_file_simple), base_dir)
+        _orig_project_root = main_mod.PROJECT_ROOT
+        main_mod.PROJECT_ROOT = str(temp_project)
+        try:
+            base_dir = _default_aura_base_dir()
+            data_dir = _task_data_dir_for(str(task_file_simple), base_dir)
 
-        _record_task_data_dir(str(task_file_simple), data_dir)
+            _record_task_data_dir(str(task_file_simple), data_dir)
 
-        # Check metadata file
-        metadata_path = os.path.join(data_dir, "task_file.json")
-        assert os.path.exists(metadata_path)
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        assert "task_file" in meta
-        assert "data_dir" in meta
-        assert "created_at" in meta
+            # Check metadata file
+            metadata_path = os.path.join(data_dir, "task_file.json")
+            assert os.path.exists(metadata_path)
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            assert "task_file" in meta
+            assert "data_dir" in meta
+            assert "created_at" in meta
 
-        # Check task index
-        index_path = os.path.join(base_dir, "task_index.json")
-        assert os.path.exists(index_path)
-        with open(index_path, "r", encoding="utf-8") as f:
-            index = json.load(f)
-        assert len(index.get("tasks", {})) >= 1
+            # Check task index
+            index_path = os.path.join(base_dir, "task_index.json")
+            assert os.path.exists(index_path)
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            assert len(index.get("tasks", {})) >= 1
+        finally:
+            main_mod.PROJECT_ROOT = _orig_project_root
 
     def test_task_data_dir_unique_per_task_file(self, temp_project):
+        import orchestrator.main as main_mod
         from orchestrator.main import _task_data_dir_for, _default_aura_base_dir
 
-        task1 = str(temp_project / "tasks" / "project_a.md")
-        task2 = str(temp_project / "tasks" / "project_b.md")
+        _orig_project_root = main_mod.PROJECT_ROOT
+        main_mod.PROJECT_ROOT = str(temp_project)
+        try:
+            task1 = str(temp_project / "tasks" / "project_a.md")
+            task2 = str(temp_project / "tasks" / "project_b.md")
 
-        # Create the files
-        os.makedirs(os.path.dirname(task1), exist_ok=True)
-        Path(task1).touch()
-        Path(task2).touch()
+            # Create the files
+            os.makedirs(os.path.dirname(task1), exist_ok=True)
+            Path(task1).touch()
+            Path(task2).touch()
 
-        base_dir = _default_aura_base_dir()
-        dir1 = _task_data_dir_for(task1, base_dir)
-        dir2 = _task_data_dir_for(task2, base_dir)
+            base_dir = _default_aura_base_dir()
+            dir1 = _task_data_dir_for(task1, base_dir)
+            dir2 = _task_data_dir_for(task2, base_dir)
 
-        assert dir1 != dir2
+            assert dir1 != dir2
+        finally:
+            main_mod.PROJECT_ROOT = _orig_project_root
 
     def test_same_filename_different_dir_different_slug(self):
         from orchestrator.main import _task_data_slug
@@ -966,27 +980,33 @@ class TestDifferentRequirementFiles:
         assert _get_active_project() == "project_y"
 
     def test_task_index_records_multiple_projects(self, temp_project, task_file_simple):
+        import orchestrator.main as main_mod
         from orchestrator.main import (
             _record_task_data_dir, _task_data_dir_for,
             _default_aura_base_dir, _task_index_path,
         )
 
-        task2 = temp_project / "tasks" / "other_mission.md"
-        task2.parent.mkdir(exist_ok=True)
-        task2.write_text("# Other mission\n", encoding="utf-8")
+        _orig_project_root = main_mod.PROJECT_ROOT
+        main_mod.PROJECT_ROOT = str(temp_project)
+        try:
+            task2 = temp_project / "tasks" / "other_mission.md"
+            task2.parent.mkdir(exist_ok=True)
+            task2.write_text("# Other mission\n", encoding="utf-8")
 
-        base_dir = _default_aura_base_dir()
-        dir1 = _task_data_dir_for(str(task_file_simple), base_dir)
-        dir2 = _task_data_dir_for(str(task2), base_dir)
+            base_dir = _default_aura_base_dir()
+            dir1 = _task_data_dir_for(str(task_file_simple), base_dir)
+            dir2 = _task_data_dir_for(str(task2), base_dir)
 
-        _record_task_data_dir(str(task_file_simple), dir1)
-        _record_task_data_dir(str(task2), dir2)
+            _record_task_data_dir(str(task_file_simple), dir1)
+            _record_task_data_dir(str(task2), dir2)
 
-        index_path = _task_index_path(base_dir)
-        with open(index_path, "r", encoding="utf-8") as f:
-            index = json.load(f)
+            index_path = _task_index_path(base_dir)
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
 
-        assert len(index.get("tasks", {})) >= 2
+            assert len(index.get("tasks", {})) >= 2
+        finally:
+            main_mod.PROJECT_ROOT = _orig_project_root
 
     def test_cleanup_orphan_projects(self, temp_project):
         from orchestrator.changelog import cleanup_orphan_projects
@@ -1752,7 +1772,7 @@ class TestStateCaching:
     def test_cache_hit_after_save(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
         Path(task_file).write_text("# Test\n", encoding="utf-8")
 
@@ -1768,7 +1788,7 @@ class TestStateCaching:
     def test_cache_invalidation_after_save(self, patched_config, reset_state_cache):
         from orchestrator import state as state_mgr
 
-        task_file = os.path.join(os.environ["AURA_PROJECT_ROOT"], "tasks", "t.md")
+        task_file = os.path.join(_get_project_root(), "tasks", "t.md")
         os.makedirs(os.path.dirname(task_file), exist_ok=True)
         Path(task_file).write_text("# Test\n", encoding="utf-8")
 
@@ -2022,14 +2042,40 @@ class TestConfig:
         assert config.WORKER_MAX_GPU_MEMORY_PERCENT == 80
         assert config.WORKER_MAX_GPU_UTIL_PERCENT == 80
 
-    def test_env_override(self):
-        import importlib
+    def test_config_from_file_only(self):
+        """Verify config reads from file, NOT from os.environ."""
         import orchestrator.config as cfg
 
-        with patch.dict(os.environ, {"AURA_CYCLE_INTERVAL": "60"}):
-            # Reload config to pick up env changes
-            cfg = importlib.reload(cfg)
-            assert cfg.CYCLE_INTERVAL_SECONDS == 60
+        # The session test config file sets CYCLE_INTERVAL=60.
+        # Verify this came from the file.
+        assert cfg.CYCLE_INTERVAL_SECONDS == 60
+
+        # Verify API key came from the test config file
+        assert cfg.AURA_API_KEY == "test-key-1234"
+        assert cfg.AURA_API_BASE_URL == "https://api.test.local"
+        assert cfg.AURA_API_MODEL == "test-model"
+
+    def test_config_file_not_found_errors(self):
+        """Verify missing config file raises FileNotFoundError with setup message."""
+        import tempfile
+        import importlib.util
+        import sys as _sys
+
+        tmpdir = tempfile.mkdtemp()
+        missing_path = os.path.join(tmpdir, "nonexistent.env")
+        try:
+            spec = importlib.util.find_spec("orchestrator.config")
+            mod = importlib.util.module_from_spec(spec)
+            mod.CONFIG_FILE_PATH = missing_path
+            mod.PROJECT_ROOT_OVERRIDE = tmpdir
+            _sys.modules["orchestrator.config"] = mod
+            spec.loader.exec_module(mod)
+            assert False, "Should have raised FileNotFoundError"
+        except FileNotFoundError as e:
+            assert "setup" in str(e).lower(), "Error should mention 'aura setup'"
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class TestResourceGuard:

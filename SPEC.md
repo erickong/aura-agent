@@ -58,7 +58,7 @@ Layer 2 workers are spawned through `orchestrator/process_mgr.py`.
 
 Supported backends:
 
-- `claude_code`: runs `claude -p @task.md --output-format stream-json`
+- `claude`: runs `claude -p @task.md --output-format stream-json`
 - `ds_code`: runs `ds-code run --workspace <task_dir>`
 
 Each worker receives a generated `task.md` and works inside `.aura/workspace/tasks/<task-id>/`.
