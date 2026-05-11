@@ -75,6 +75,8 @@ WORKER_CUDA_VISIBLE_DEVICES = os.environ.get("AURA_WORKER_CUDA_VISIBLE_DEVICES",
 
 AURA_LAYER2_BACKEND = os.environ.get("AURA_LAYER2_BACKEND", "claude_code")
 
+AURA_CLAUDE_BIN = os.environ.get("AURA_CLAUDE_BIN", "").strip()
+
 AURA_DEEPSEEK_API_KEY = os.environ.get("AURA_DEEPSEEK_API_KEY", "")
 AURA_DSCODE_MODEL = os.environ.get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
 AURA_DSCODE_MAX_TURNS = int(os.environ.get("AURA_DSCODE_MAX_TURNS", str(DEFAULT_MAX_TURNS)))

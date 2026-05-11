@@ -1281,7 +1281,7 @@ def _call_api_with_retry(
     for attempt in range(API_RETRY_COUNT):
         try:
             t0 = time.time()
-            print(f"  [API] Calling {ANTHROPIC_MODEL} (attempt {attempt + 1}/{API_RETRY_COUNT}, timeout {_API_TIMEOUT}s)...")
+            print(f"  [API] Calling {ANTHROPIC_MODEL}...")
             result = client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=ANTHROPIC_MAX_TOKENS,

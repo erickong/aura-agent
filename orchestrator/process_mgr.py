@@ -34,6 +34,7 @@ from .config import (
     WORKER_MIN_GPU_MEMORY_FREE_GB,
     WORKER_CUDA_VISIBLE_DEVICES,
     AURA_LAYER2_BACKEND,
+    AURA_CLAUDE_BIN,
     AURA_DEEPSEEK_API_KEY,
     AURA_DSCODE_MAX_TURNS,
     AURA_DSCODE_MODEL,
@@ -660,6 +661,44 @@ def _load_process_records() -> None:
             continue
 
 
+def _resolve_executable(name: str, configured: str = "") -> str | None:
+    """Resolve an executable path cross-platform.
+
+    On Windows, Python subprocess may fail with bare npm shim names like
+    'claude' even when PowerShell can run them, because the actual executable
+    is often a .cmd shim. Prefer .cmd/.bat when resolving by PATH.
+    """
+    if configured:
+        path = os.path.expandvars(os.path.expanduser(configured.strip()))
+        return path if path else None
+
+    if sys.platform == "win32":
+        candidates = [
+            f"{name}.cmd",
+            f"{name}.CMD",
+            f"{name}.bat",
+            f"{name}.BAT",
+            f"{name}.exe",
+            name,
+        ]
+    else:
+        candidates = [name]
+
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _wrap_windows_script_cmd(exe: str, args: list[str]) -> list[str]:
+    """Run .cmd/.bat through cmd.exe for maximum Windows compatibility."""
+    if sys.platform == "win32" and exe.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/d", "/c", exe, *args]
+    return [exe, *args]
+
+
 def spawn(task_id: str, task_dir: str, task_md_path: str, budget_minutes: int) -> str:
     """Spawn a Layer 2 worker process for a task.
 
@@ -690,17 +729,24 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
     if not ok:
         return f"ERROR: Resource preflight failed for task {task_id}: {preflight}"
 
-    # Build Claude Code command
-    # Using -p for one-shot mode with the task file as context
-    # --verbose is REQUIRED when using --output-format=stream-json
-    cmd = [
-        "claude",
+    # Resolve claude executable cross-platform
+    claude_bin = _resolve_executable("claude", AURA_CLAUDE_BIN)
+    if not claude_bin:
+        return (
+            "ERROR: Claude Code CLI not found in PATH. "
+            "Install it with `npm install -g @anthropic-ai/claude-code`, "
+            "or set AURA_CLAUDE_BIN to the executable path."
+        )
+
+    claude_args = [
         "-p",
-        f"@task.md",
+        "@task.md",
         "--max-turns", str(DEFAULT_MAX_TURNS),
         "--output-format", "stream-json",
         "--verbose",
     ]
+
+    cmd = _wrap_windows_script_cmd(claude_bin, claude_args)
 
     output_path = os.path.join(task_dir, "output.jsonl")
     error_path = os.path.join(task_dir, "error.log")
@@ -750,8 +796,23 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
                 f"Output: {task_dir}/output.jsonl "
                 f"Budget: {budget_minutes}min.{affinity_note} {preflight}")
 
+    except FileNotFoundError as e:
+        return (
+            "ERROR: Failed to start Claude Code CLI.\n"
+            f"Resolved claude_bin: {claude_bin!r}\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {task_dir}\n"
+            f"PATH: {os.environ.get('PATH', '')}\n"
+            f"Details: {e}"
+        )
     except Exception as e:
-        return f"ERROR spawning task {task_id}: {e}"
+        return (
+            "ERROR: Failed to spawn Claude Code worker.\n"
+            f"Resolved claude_bin: {claude_bin!r}\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {task_dir}\n"
+            f"Details: {type(e).__name__}: {e}"
+        )
 
 
 def _spawn_dscode(task_id: str, task_dir: str, task_md_path: str, budget_minutes: int) -> str:

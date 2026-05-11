@@ -161,7 +161,7 @@ def review_cycle(force: bool = False) -> dict:
     for attempt in range(API_RETRY_COUNT):
         try:
             t0 = time.time()
-            print(f"  [Review] Calling {ANTHROPIC_MODEL} (attempt {attempt + 1}/{API_RETRY_COUNT}, timeout {_API_TIMEOUT}s)...")
+            print(f"  [Review] Calling {ANTHROPIC_MODEL}...")
             response = client.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=min(ANTHROPIC_MAX_TOKENS, 2048),
