@@ -746,23 +746,32 @@ def _reconcile_stopped_workers() -> dict:
         elapsed = worker["elapsed_minutes"]
         output_size = worker["output_size"]
 
+        # Check whether the worker left a result.md claiming completion.
+        result_path = os.path.join(get_workspace_dir(), "tasks", task_id, "result.md")
+        has_result_md = os.path.exists(result_path)
+
         if output_size > 0:
-            print(f"\n  [DONE] Worker {task_id} finished (PID {worker['pid']}). "
-                  f"Output: {output_size} bytes. Marking completed.")
-            try:
-                state_mgr.update_task(task_id, "completed",
-                    f"Worker finished. Output: {output_size} bytes.",
-                    f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
+            if has_result_md:
+                # Don't auto-complete — result.md might be premature
+                # (e.g. "training launched"). Let L1 verify in the next cycle.
+                print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
+                      f"with result.md. Letting L1 evaluate before marking complete.")
                 events["changed"] = True
-                events["completed"].append(task_id)
+            else:
+                # Worker produced output but never wrote result.md — task is
+                # incomplete. Mark pending so L1 can decide whether to re-spawn
+                # or diagnose.
+                print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
+                      f"with output but no result.md. Marking pending for L1 evaluation.")
                 try:
-                    generate_task_summary(task_id, "completed",
-                        f"Worker finished. Output: {output_size} bytes.",
+                    state_mgr.update_task(
+                        task_id,
+                        "pending",
+                        f"Worker stopped with output ({output_size} bytes) but no result.md; task is incomplete and needs continuation or diagnosis.",
                         f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
-                except Exception:
-                    pass
-            except Exception as state_err:
-                print(f"    [WARN] Could not update task: {state_err}")
+                    events["changed"] = True
+                except Exception as state_err:
+                    print(f"    [WARN] Could not update task: {state_err}")
         else:
             print(f"\n  [CRASH] Worker {task_id} (PID {worker['pid']}) died with NO output.")
             try:

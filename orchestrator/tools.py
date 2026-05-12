@@ -826,45 +826,15 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
     # By always writing fresh content here, we ensure the worker always
     # receives the orchestrator's INTENDED task, not leftover garbage.
     task_md_path = os.path.join(task_dir, "task.md")
-    task_content = f"""# Task {task_id}
-
-{description}
-
-## Project Context
+    task_content = f"""## Project Context
 {project_context_text}
 
-Project Context is background and constraints only. Your assigned work is the
-specific Task {task_id} above. Do not attempt the whole final goal unless this
-task explicitly asks you to do so.
-
-## Task Hierarchy
-{hierarchy_context_text}
-
-Tasks are intentionally hierarchical: ROOT is the final goal, ROOT children
-are broad planning categories, and concrete worker tasks live under those
-categories. Treat sibling task outcomes as shared local context for this
-category.
-
-## Sibling Tasks Context
-{sibling_context_text}
-
-Do not inspect other task-file data directories under `.aura` for state,
-progress, workspace outputs, summaries, caches, or task metadata. Other task
-directories' memory files may be used only as transferable lessons, not as
-current-task evidence.
-
-## Constraints
-- Budget: {budget_minutes} minutes
-- Max turns: {DEFAULT_MAX_TURNS}
-- Current working directory: {task_dir}
-- This current directory is the task output directory. Put all outputs here.
+## Hard Resource Policy
+{process_mgr.resource_policy_text()}
 
 ## Process Safety Rule
 Do not use `taskkill /IM python.exe`, `taskkill /F /IM python.exe`, `pkill python`,
 or `killall python`. Only terminate subprocesses started by the current task itself.
-
-## Hard Resource Policy
-{process_mgr.resource_policy_text()}
 
 ## Progress Tracking (output.jsonl)
 - The orchestrator monitors your output.jsonl for progress detection.
@@ -890,8 +860,40 @@ If this task involves a long-running subprocess, such as a long training job:
 7. For resource-heavy training, start with a small stable configuration first (e.g. small batch size, few workers, small model/data subset, single GPU). Gradually scale up only after confirming stability. Do not start at maximum resource usage — this triggers the resource guard and wastes time on failed attempts.
 
 ## Output Requirements
-- When the task is completed or failed (see Long-Running Subprocess Rules above for definition), write a brief result summary to: result.md in the current directory.
-- List all created files and what they contain.
+- `result.md` is the task's FINAL outcome. ONLY create it when your whole task assigned in task.md is DONE. Do not create `result.md` if you have subprocesses still running (e.g. training). If you failed your job and cannot continue, you should also create this file.
+- When done, write a brief result summary to: result.md in the current directory. List all created files and what they contain.
+
+Do not inspect other task-file data directories under `.aura` for state,
+progress, workspace outputs, summaries, caches, or task metadata. Other task
+directories' memory files may be used only as transferable lessons, not as
+current-task evidence.
+
+---
+
+# Task {task_id}
+
+{description}
+
+Project Context above is background and constraints only. Your assigned work is the
+specific Task {task_id} above. Do not attempt the whole final goal unless this
+task explicitly asks you to do so.
+
+## Task Hierarchy
+{hierarchy_context_text}
+
+Tasks are intentionally hierarchical: ROOT is the final goal, ROOT children
+are broad planning categories, and concrete worker tasks live under those
+categories. Treat sibling task outcomes as shared local context for this
+category.
+
+## Sibling Tasks Context
+{sibling_context_text}
+
+## Constraints
+- Budget: {budget_minutes} minutes
+- Max turns: {DEFAULT_MAX_TURNS}
+- Current working directory: {task_dir}
+- This current directory is the task output directory. Put all outputs here.
 """
     with open(task_md_path, "w", encoding="utf-8") as f:
         f.write(task_content)

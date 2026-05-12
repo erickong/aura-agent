@@ -188,6 +188,8 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 - Write genuinely important lessons to long-term memory — don't spam it
 - Every status change must have a reason AND evidence
 - The mission does not end until the goal is achieved
+- NEVER mention result.md in task descriptions or deliverables. result.md is an infrastructure file produced automatically when the task truly completes or fails. Asking workers to create it encourages premature termination with subprocesses still running.
+- When a stopped worker has result.md, you must verify it before marking the task complete. Read result.md and check: (a) does the content show the assigned task is truly DONE, not just "launched"? (b) are there still live subprocesses (check list_running_tasks, workspace output tail, or resource signals)? If uncertain, leave the task in its current state and wait for the next cycle for more evidence.
 
 ## Current Context
 
