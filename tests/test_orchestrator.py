@@ -1571,6 +1571,69 @@ class TestTools:
         result = impl_web_fetch("not-a-url", 100)
         assert "ERROR" in result
 
+    def test_web_search_no_key_configured(self):
+        """web_search returns error when AURA_SEARCH_API_KEY is not set."""
+        import orchestrator.config as cfg
+
+        _orig = cfg.AURA_SEARCH_API_KEY
+        cfg.AURA_SEARCH_API_KEY = ""
+        try:
+            from orchestrator.tools import impl_web_search
+
+            result = impl_web_search("test query")
+            assert "ERROR" in result
+            assert "not configured" in result
+        finally:
+            cfg.AURA_SEARCH_API_KEY = _orig
+
+    def test_web_search_empty_query(self):
+        """web_search returns error for empty query."""
+        import orchestrator.config as cfg
+
+        _orig = cfg.AURA_SEARCH_API_KEY
+        cfg.AURA_SEARCH_API_KEY = "fake-key-for-test"
+        try:
+            from orchestrator.tools import impl_web_search
+
+            result = impl_web_search("")
+            assert "ERROR" in result
+            assert "empty" in result
+        finally:
+            cfg.AURA_SEARCH_API_KEY = _orig
+
+    def test_web_search_live(self):
+        """Live Tavily API search returns expected result structure."""
+        import orchestrator.config as cfg
+
+        _orig = cfg.AURA_SEARCH_API_KEY
+        cfg.AURA_SEARCH_API_KEY = "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"
+        try:
+            from orchestrator.tools import impl_web_search
+
+            result = impl_web_search("Python programming", max_results=3)
+            # Should succeed with results
+            assert "ERROR" not in result
+            assert "Web search results for" in result
+            assert "URL:" in result
+            assert len(result) > 100  # meaningful content
+        finally:
+            cfg.AURA_SEARCH_API_KEY = _orig
+
+    def test_web_search_invalid_key(self):
+        """web_search returns error for invalid Tavily API key."""
+        import orchestrator.config as cfg
+
+        _orig = cfg.AURA_SEARCH_API_KEY
+        cfg.AURA_SEARCH_API_KEY = "tvly-invalid-key-12345"
+        try:
+            from orchestrator.tools import impl_web_search
+
+            result = impl_web_search("test query")
+            assert "ERROR" in result
+            assert "Tavily" in result
+        finally:
+            cfg.AURA_SEARCH_API_KEY = _orig
+
     def test_list_running_tasks_empty(self):
         from orchestrator.tools import impl_list_running_tasks
 

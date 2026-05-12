@@ -627,7 +627,13 @@ def _load_process_records() -> None:
     if not os.path.isdir(tasks_dir):
         return
 
-    for task_id in os.listdir(tasks_dir):
+    try:
+        task_ids = os.listdir(tasks_dir)
+    except OSError as e:
+        print(f"[process_mgr] WARNING: Cannot list tasks dir (system resource issue): {e}")
+        return
+
+    for task_id in task_ids:
         task_dir = os.path.join(tasks_dir, task_id)
         record_path = _process_record_path(task_dir)
         if task_id in _active_processes or not os.path.exists(record_path):
@@ -930,12 +936,20 @@ def kill(task_id: str) -> str:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                            capture_output=True, check=False, timeout=10)
         else:
-            for child in children:
-                child.terminate()
-            proc.terminate()
-            time.sleep(2)
-            if proc.is_running():
-                proc.kill()
+            # Kill the entire process group atomically.
+            # The worker was spawned with preexec_fn=os.setsid, so it is the
+            # leader of its own process group. killpg sends SIGKILL to every
+            # process in that group, avoiding the race between listing
+            # children and killing them individually.
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            # Fallback: ensure the root process itself is dead
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
         # Wait for process to actually exit
         try:
@@ -947,7 +961,8 @@ def kill(task_id: str) -> str:
         _active_processes[task_id]["running"] = False
         _write_process_record(_active_processes[task_id])
 
-        return f"OK: Killed task {task_id} (PID: {pid}, children: {len(children)})"
+        child_count = len(children)
+        return f"OK: Killed task {task_id} (PID: {pid}, children: {child_count})"
 
     except psutil.NoSuchProcess:
         _active_processes[task_id]["running"] = False

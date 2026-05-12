@@ -27,6 +27,7 @@ import time
 import signal
 import re
 import shutil
+import psutil
 from datetime import datetime
 from pathlib import Path
 
@@ -261,11 +262,12 @@ def _record_task_data_dir(task_file: str, data_dir: str) -> None:
 # Then set orchestrator.config.CONFIG_FILE_PATH so config.py reads from it directly.
 GLOBAL_CONFIG_PATH = _global_config_path
 
-# Check for --config / -c early (before config module is imported).
+# Check for --config / -c and --workers / -w early (before config module is imported).
 # Also removes these args from sys.argv so argparse doesn't choke on
 # --config appearing after the subcommand (e.g. "start --config=.env ...")
 _new_argv = [sys.argv[0]]
 _skip_next = False
+_workers_override = None
 for i, arg in enumerate(sys.argv[1:], 1):
     if _skip_next:
         _skip_next = False
@@ -280,8 +282,31 @@ for i, arg in enumerate(sys.argv[1:], 1):
     elif arg.startswith("-c="):
         _config_file_override = os.path.abspath(arg.split("=", 1)[1])
         continue
+    elif arg in ("--workers", "-w") and i + 1 < len(sys.argv):
+        _workers_override = sys.argv[i + 1]
+        _skip_next = True
+        continue
+    elif arg.startswith("--workers="):
+        _workers_override = arg.split("=", 1)[1]
+        continue
+    elif arg.startswith("-w="):
+        _workers_override = arg.split("=", 1)[1]
+        continue
     _new_argv.append(arg)
 sys.argv = _new_argv
+
+def _apply_workers_override(cfg_mod, value):
+    if value is None:
+        return
+    try:
+        workers = int(value)
+    except ValueError:
+        raise SystemExit(f"[ERROR] --workers must be an integer, got: {value!r}")
+    if workers < 1:
+        raise SystemExit("[ERROR] --workers must be >= 1")
+    cfg_mod.MAX_CONCURRENT_TASKS = workers
+    print(f"[CONFIG] Workers override: {workers}")
+
 
 # ── NOW load config module with overrides BEFORE its code runs ─────────
 # We use importlib.util.module_from_spec so we can set CONFIG_FILE_PATH,
@@ -296,7 +321,7 @@ _existing_cfg = _sys.modules.get("orchestrator.config")
 if _existing_cfg is not None and getattr(_existing_cfg, "_config_data", None) is not None:
     # Config already loaded from file — don't replace. Tests or embedded
     # usage pre-configure the module before main.py is imported.
-    pass
+    _apply_workers_override(_existing_cfg, _workers_override)
 else:
     # Determine data_dir BEFORE config module loads (so DATA_DIR_OVERRIDE is final)
     _select_task_data_dir_before_import()
@@ -314,6 +339,7 @@ else:
 
     _sys.modules["orchestrator.config"] = _cfg_mod
     _cfg_spec.loader.exec_module(_cfg_mod)
+    _apply_workers_override(_cfg_mod, _workers_override)
 
 
 from orchestrator.config import (
@@ -407,19 +433,40 @@ class ShutdownRequested(KeyboardInterrupt):
 
 
 def _kill_running_workers(prefix: str = "[SHUTDOWN]") -> None:
-    """Kill all tracked Layer 2 workers that are still running."""
+    """Kill all tracked Layer 2 workers and verify no survivors remain."""
     running = [worker for worker in process_mgr.list_all() if worker.get("running")]
     if not running:
         print(f"{prefix} No Layer 2 workers running.")
         return
 
     print(f"{prefix} Killing {len(running)} Layer 2 worker(s)...")
+    killed_pids: list[int] = []
     for worker in running:
         try:
+            pid = worker["pid"]
+            killed_pids.append(pid)
             result = process_mgr.kill(worker["task_id"])
             print(f"  {result}")
         except Exception as kill_err:
             print(f"  [WARN] Failed to kill {worker['task_id']}: {kill_err}")
+
+    # ── Survivor sweep ─────────────────────────────────────────────
+    # After killing, briefly wait then scan for any children that
+    # escaped the process tree (e.g. via DETACHED_PROCESS / setsid).
+    time.sleep(1)
+    for pid in killed_pids:
+        try:
+            proc = psutil.Process(pid)
+            if proc.is_running():
+                survivors = proc.children(recursive=True)
+                for child in survivors:
+                    try:
+                        print(f"{prefix} Force-killing survivor: PID {child.pid} ({child.name()})")
+                        child.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except psutil.NoSuchProcess:
+            continue
 
 
 def _clear_wakeup_signal() -> None:
@@ -454,7 +501,12 @@ def _sleep_until_next_wake(interval: int) -> None:
             _clear_wakeup_signal()
             break
 
-        tracked = process_mgr.list_all()
+        try:
+            tracked = process_mgr.list_all()
+        except OSError as e:
+            print(f"[Watchdog] WARNING: Cannot list processes (resource issue, will retry next cycle): {e}")
+            continue
+
         for worker in tracked:
             entry = process_mgr._active_processes.get(worker["task_id"], {})
             if entry.get("killed_at"):
@@ -1033,6 +1085,8 @@ def cmd_start(args):
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal_handler)
 
     cycle_count = 0
     _process_start_time = time.time()
@@ -1503,6 +1557,8 @@ def main():
         break
     parser = argparse.ArgumentParser(description="Aura Agent - Autonomous Task Orchestrator")
     parser.add_argument("--config", "-c", help="Path to .env config file", default=None)
+    parser.add_argument("--workers", "-w", type=int, default=None,
+                        help="Max concurrent workers (default: 2, or AURA_MAX_CONCURRENT_TASKS env)")
     parser.add_argument("--data-dir", default=None,
                         help="Data directory for process files (memory, state, workspace). "
                              "Default: ./.aura/<task-file-name>-<path-hash>/ for task-file commands.")

@@ -215,6 +215,7 @@ AURA_DEEPSEEK_API_KEY = _get("AURA_DEEPSEEK_API_KEY") or ""
 AURA_DSCODE_MODEL = _get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
 AURA_DSCODE_MAX_TURNS = _get_int("AURA_DSCODE_MAX_TURNS", str(DEFAULT_MAX_TURNS))
 AURA_DSCODE_BASE_URL = _get("AURA_DSCODE_BASE_URL") or ""
+AURA_SEARCH_API_KEY = _get("AURA_SEARCH_API_KEY", "")
 
 # ── Memory / stuck detection ─────────────────────────────────────────
 LONG_TERM_MEMORY_MAX_CHARS = 3000

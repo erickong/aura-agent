@@ -138,6 +138,16 @@ def cmd_setup(args, config_ns):
     config["AURA_API_KEY"] = val or default_key
     print()
 
+    # ── Web Search API Key (optional, enables web_search tool) ─────────
+    default_search_key = existing_config.get("AURA_SEARCH_API_KEY", "")
+    search_masked = default_search_key[:8] + "***" if len(default_search_key) > 8 else ("(not set / disabled)" if not default_search_key else "(not set)")
+    print("─ Web Search (Tavily) ────────────────────────────────────────")
+    print("  Optional. Get a free API key at https://tavily.com")
+    print("  Without this, the web_search tool will not be available.")
+    val = input(f"  Tavily API Key [{search_masked}]: ").strip()
+    config["AURA_SEARCH_API_KEY"] = val or default_search_key
+    print()
+
     # ── Base URL selection ───────────────────────────────────────────
     print("─ API Provider ─────────────────────────────────────────────")
     print("  Select the API provider and base URL:")

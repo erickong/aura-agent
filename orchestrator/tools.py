@@ -110,6 +110,31 @@ TOOL_DEFINITIONS = [
         }
     },
     {
+        "name": "web_search",
+        "description": "Search the web using the Tavily search API. Returns titles, URLs, and content snippets for each result. Use this for research, fact-checking, or finding up-to-date information.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string.",
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                    "description": "Search depth: 'basic' is faster and cheaper, 'advanced' does a more thorough search.",
+                    "default": "basic",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return. Default 5, max 20.",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "spawn_task",
         "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. Maximum 2 concurrent workers. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
         "input_schema": {
@@ -853,8 +878,19 @@ or `killall python`. Only terminate subprocesses started by the current task its
 - The orchestrator will NOT kill you just because output is slow — it checks CPU
   to distinguish "computing" from "dead zombie".
 
+## Long-Running Subprocess Rules
+If this task involves a long-running subprocess, such as a long training job:
+
+1. Do not start subprocesses in detached or background mode (e.g. no `start_new_session=True`, `DETACHED_PROCESS`, `subprocess.Popen` with `shell=True` + `&`, `nohup`, or `screen`/`tmux`). Keep subprocesses attached so Aura can stop them when the orchestrator shuts down.
+2. Do not exit before the subprocess has reached a clear final state. Keep monitoring it until the task is completed, failed, or the time budget is exhausted.
+3. Only write `result.md` when the task is completed or failed with clear evidence. Do not write `result.md` merely because the subprocess was launched or because one training process exited.
+4. Save subprocess progress to `train_progress.log` and save checkpoints regularly, so training can be resumed after interruption.
+5. When starting, first check whether a previous run was interrupted. If resumable checkpoints/logs exist, try to resume training instead of starting from scratch. Preserve continuity of learning rate, optimizer state, scheduler state, epoch/step count, random seed, and other training parameters whenever possible.
+6. If the subprocess exits before the task goal is achieved, diagnose the reason. If appropriate, adjust parameters and restart or resume training instead of marking the task complete.
+7. For resource-heavy training, start with a small stable configuration first (e.g. small batch size, few workers, small model/data subset, single GPU). Gradually scale up only after confirming stability. Do not start at maximum resource usage — this triggers the resource guard and wastes time on failed attempts.
+
 ## Output Requirements
-- When done, write a brief result summary to: result.md in the current directory.
+- When the task is completed or failed (see Long-Running Subprocess Rules above for definition), write a brief result summary to: result.md in the current directory.
 - List all created files and what they contain.
 """
     with open(task_md_path, "w", encoding="utf-8") as f:
@@ -1026,6 +1062,80 @@ def impl_web_fetch(url: str, max_chars: int = 5000) -> str:
         return f"ERROR fetching {url}: {e}"
 
 
+def impl_web_search(query: str, search_depth: str = "basic", max_results: int = 5) -> str:
+    """Search the web using the Tavily Search API."""
+    from .config import AURA_SEARCH_API_KEY
+
+    if not AURA_SEARCH_API_KEY:
+        return (
+            "ERROR: Web search is not configured. "
+            "Set AURA_SEARCH_API_KEY in your config file (~/.aura/config.env) "
+            "or run 'aura setup' to configure it."
+        )
+
+    if not query or not query.strip():
+        return "ERROR: Search query must not be empty."
+
+    if search_depth not in ("basic", "advanced"):
+        search_depth = "basic"
+
+    max_results = max(1, min(max_results, 20))
+
+    request_body = json.dumps({
+        "query": query.strip(),
+        "search_depth": search_depth,
+        "max_results": max_results,
+        "api_key": AURA_SEARCH_API_KEY,
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=request_body,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 AuraAgent/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        return f"ERROR: Tavily API returned HTTP {e.code} {e.reason}. Details: {body}"
+    except urllib.error.URLError as e:
+        return f"ERROR: Failed to connect to Tavily API: {e.reason}"
+    except Exception as e:
+        return f"ERROR calling Tavily API: {e}"
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        return f"ERROR: Failed to parse Tavily API response: {e}"
+
+    results = data.get("results", [])
+    if not results:
+        return f"No results found for query: {query}"
+
+    lines = [f"Web search results for: {query} ({len(results)} results, depth={search_depth})", ""]
+    for i, result in enumerate(results, 1):
+        title = result.get("title", "(no title)")
+        url = result.get("url", "(no url)")
+        content = result.get("content", "(no content)")
+        if len(content) > 300:
+            content = content[:300] + "..."
+        lines.append(f"{i}. {title}")
+        lines.append(f"   URL: {url}")
+        lines.append(f"   {content}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def impl_no_op(reason: str, next_check_focus: str = "") -> str:
     """No operation - just log."""
     focus_msg = f" Next check focus: {next_check_focus}" if next_check_focus else ""
@@ -1038,6 +1148,7 @@ TOOL_IMPLS = {
     "write_file": impl_write_file,
     "list_directory": impl_list_directory,
     "web_fetch": impl_web_fetch,
+    "web_search": impl_web_search,
     "spawn_task": impl_spawn_task,
     "kill_task": impl_kill_task,
     "list_running_tasks": impl_list_running_tasks,
@@ -1047,6 +1158,20 @@ TOOL_IMPLS = {
     "write_memory": impl_write_memory,
     "no_op": impl_no_op,
 }
+
+
+def get_active_tool_definitions() -> list[dict]:
+    """Return tool definitions to send to the LLM, gated by config.
+
+    Tools whose required configuration is not set are excluded.
+    Currently: web_search is hidden when AURA_SEARCH_API_KEY is empty.
+    """
+    from .config import AURA_SEARCH_API_KEY
+
+    active = list(TOOL_DEFINITIONS)
+    if not AURA_SEARCH_API_KEY:
+        active = [t for t in active if t["name"] != "web_search"]
+    return active
 
 
 def execute_tool(name: str, params: dict[str, Any]) -> str:

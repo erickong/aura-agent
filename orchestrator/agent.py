@@ -42,7 +42,7 @@ from .config import (
     TOOL_CALL_BUDGET_DIAGNOSTIC,
     TOOL_CALL_BUDGET_PLANNING,
 )
-from .tools import TOOL_DEFINITIONS, execute_tool
+from .tools import TOOL_DEFINITIONS, execute_tool, get_active_tool_definitions
 from . import state as state_mgr
 from . import memory as memory_mgr
 from . import progress as progress_mgr
@@ -1139,7 +1139,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 client,
                 system=_ORCHESTRATOR_SYSTEM_PROMPT,
                 messages=messages,
-                tools=TOOL_DEFINITIONS,
+                tools=get_active_tool_definitions(),
             )
             api_call_count += 1
 
