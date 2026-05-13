@@ -1547,7 +1547,18 @@ class TestTools:
         task_md = Path(get_workspace_dir()) / "tasks" / "A1.1" / "task.md"
         content = task_md.read_text(encoding="utf-8")
         assert "Guiding Philosophy" not in content
-        assert content.startswith("# Task A1.1")
+
+        # Cacheable stable prefix comes first, then --- separator, then task-specific content.
+        assert content.startswith("## Project Context")
+        assert "## Hard Resource Policy" in content
+        assert "## Process Safety Rule" in content
+        assert "## Progress Tracking" in content
+        assert "## Long-Running Subprocess Rules" in content
+        assert "## Output Requirements" in content
+        assert "\n---\n" in content
+
+        # Task-specific section after the separator.
+        assert "# Task A1.1" in content
         assert "## Task Hierarchy" in content
         assert "## Sibling Tasks Context" in content
         assert "A1.1 (current task)" in content

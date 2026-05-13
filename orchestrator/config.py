@@ -258,3 +258,8 @@ TOKEN_PRICE_OUTPUT = _get_float("AURA_TOKEN_PRICE_OUTPUT", "1.74")
 TOOL_CALL_BUDGET_NORMAL = _get_int("AURA_TOOL_CALL_BUDGET_NORMAL", "12")
 TOOL_CALL_BUDGET_DIAGNOSTIC = _get_int("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40")
 TOOL_CALL_BUDGET_PLANNING = _get_int("AURA_TOOL_CALL_BUDGET_PLANNING", "40")
+
+# Hard limit on API calls per cycle. If the orchestrator exceeds this, the
+# cycle aborts with a forced text response. Prevents catastrophic $1+ cycles
+# where the model loops on polling read/list/no_op calls indefinitely.
+MAX_TOOL_CALLS_PER_CYCLE = _get_int("AURA_MAX_TOOL_CALLS_PER_CYCLE", "20")

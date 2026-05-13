@@ -52,6 +52,7 @@ _resource_monitor_stop = threading.Event()
 
 _BYTES_PER_GB = 1024 ** 3
 _PROCESS_START_TOLERANCE_SECONDS = 30
+_REGISTERED_SUBPROCESS_LOG_STALE_SECONDS = 300
 
 
 def _gb_to_mb(value: float) -> float:
@@ -560,7 +561,7 @@ def _resource_monitor_loop() -> None:
         with _process_lock:
             items = list(_active_processes.items())
         for task_id, entry in items:
-            if entry.get("killed_at") or not _entry_process_is_alive(entry):
+            if entry.get("killed_at") or not _promote_live_registered_subprocess_if_needed(task_id, entry):
                 continue
             metrics = _process_tree_metrics(entry["pid"], sample_cpu=True)
             aggregate = _aggregate_resource_samples(entry.get("resource_samples", []))
@@ -600,19 +601,164 @@ def _process_record_path(task_dir: str) -> str:
     return os.path.join(task_dir, "process.json")
 
 
+def _read_process_record(task_dir: str) -> dict:
+    record_path = _process_record_path(task_dir)
+    try:
+        with open(record_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _registered_subprocesses(record: dict) -> list[dict]:
+    value = (
+        record.get("managed_subprocesses")
+        or record.get("child_processes")
+        or record.get("subprocesses")
+        or []
+    )
+    if isinstance(value, dict):
+        value = [value]
+    return [item for item in value if isinstance(item, dict) and item.get("pid")]
+
+
+def _resolve_record_path(task_dir: str, path: str | None) -> str | None:
+    if not path:
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(str(path)))
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.abspath(os.path.join(task_dir, expanded))
+
+
+def _registered_subprocess_alive(child: dict) -> bool:
+    try:
+        pid = int(child.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if not _is_alive(pid):
+        return False
+
+    started_at = child.get("started_at") or child.get("start_time")
+    # For compatibility with older task records, accept a live PID when the
+    # worker did not record a start timestamp. New task.md instructions require
+    # started_at so PID reuse can be rejected.
+    if not started_at:
+        return True
+    return _pid_matches_started_at(pid, started_at)
+
+
+def _registered_subprocess_log_status(task_dir: str, child: dict) -> dict:
+    log_path = _resolve_record_path(
+        task_dir,
+        child.get("log_path") or child.get("progress_log") or child.get("monitor_path"),
+    )
+    size = 0
+    age_seconds = None
+    if log_path and os.path.exists(log_path):
+        try:
+            size = os.path.getsize(log_path)
+            age_seconds = max(0.0, time.time() - os.path.getmtime(log_path))
+        except OSError:
+            pass
+    return {
+        "log_path": log_path,
+        "log_size": size,
+        "log_age_seconds": age_seconds,
+        "log_stale": (
+            age_seconds is None
+            or age_seconds >= _REGISTERED_SUBPROCESS_LOG_STALE_SECONDS
+        ),
+    }
+
+
+def _live_registered_subprocesses(record: dict, task_dir: str) -> list[dict]:
+    live: list[dict] = []
+    for child in _registered_subprocesses(record):
+        if not _registered_subprocess_alive(child):
+            continue
+        enriched = dict(child)
+        enriched.update(_registered_subprocess_log_status(task_dir, child))
+        live.append(enriched)
+    return live
+
+
+def _promote_live_registered_subprocess_if_needed(task_id: str, entry: dict) -> bool:
+    if _entry_process_is_alive(entry):
+        return True
+
+    record = _read_process_record(entry["task_dir"])
+    live_children = _live_registered_subprocesses(record, entry["task_dir"])
+    if not live_children:
+        return False
+
+    child = live_children[0]
+    entry["worker_pid"] = entry.get("worker_pid", entry.get("pid"))
+    entry["pid"] = int(child["pid"])
+    entry["process"] = None
+    entry["registered_subprocess"] = child
+    entry["managed_subprocesses"] = _registered_subprocesses(record)
+    entry["monitor_path"] = child.get("log_path") or entry.get("output_path")
+    child_started_at = _parse_started_at(child.get("started_at") or child.get("start_time"))
+    if child_started_at is not None:
+        entry["started_at"] = child_started_at
+    entry["killed_at"] = None
+    _active_processes[task_id] = entry
+    return True
+
+
+def get_process_record_status(task_id: str) -> dict:
+    """Return a lightweight status summary from a task's process.json."""
+    task_dir = os.path.join(get_workspace_dir(), "tasks", task_id)
+    record = _read_process_record(task_dir)
+    if not record:
+        return {"exists": False, "live_subprocesses": []}
+
+    live_children = _live_registered_subprocesses(record, task_dir)
+    children = []
+    for child in _registered_subprocesses(record):
+        enriched = dict(child)
+        enriched.update(_registered_subprocess_log_status(task_dir, child))
+        enriched["running"] = _registered_subprocess_alive(child)
+        children.append(enriched)
+
+    return {
+        "exists": True,
+        "pid": record.get("pid"),
+        "task_id": record.get("task_id", task_id),
+        "output_path": record.get("output_path"),
+        "monitor_path": record.get("monitor_path"),
+        "managed_subprocesses": children,
+        "live_subprocesses": live_children,
+    }
+
+
 def _write_process_record(entry: dict) -> None:
     record_path = _process_record_path(entry["task_dir"])
+    existing = _read_process_record(entry["task_dir"])
     killed_at = entry.get("killed_at")
     if hasattr(killed_at, "isoformat"):
         killed_at = killed_at.isoformat()
+    managed_subprocesses = (
+        entry.get("managed_subprocesses")
+        or existing.get("managed_subprocesses")
+        or existing.get("child_processes")
+        or existing.get("subprocesses")
+        or []
+    )
+    worker_pid = entry.get("worker_pid") or existing.get("worker_pid")
     record = {
         "pid": entry["pid"],
+        "worker_pid": worker_pid,
         "task_id": entry["task_id"],
         "task_dir": entry["task_dir"],
         "started_at": entry["started_at"].isoformat()
         if hasattr(entry["started_at"], "isoformat") else str(entry["started_at"]),
         "budget_minutes": entry["budget_minutes"],
         "output_path": entry["output_path"],
+        "monitor_path": entry.get("monitor_path"),
+        "managed_subprocesses": managed_subprocesses,
         "killed_at": killed_at,
         "resource_limits": entry.get("resource_limits", _resource_limits()),
         "resource_violation": entry.get("resource_violation"),
@@ -648,18 +794,37 @@ def _load_process_records() -> None:
             with open(record_path, "r", encoding="utf-8") as f:
                 record = json.load(f)
             pid = int(record["pid"])
-            if record.get("killed_at") or not _record_process_is_alive(record):
+            worker_alive = (not record.get("killed_at")) and _record_process_is_alive(record)
+            live_children = _live_registered_subprocesses(record, task_dir)
+            if not worker_alive and not live_children:
                 _dead_record_cache[record_path] = record_mtime
                 continue
-            started_at = datetime.fromisoformat(record.get("started_at", ""))
+            active_pid = pid
+            registered_subprocess = None
+            monitor_path = record.get("monitor_path")
+            if not worker_alive and live_children:
+                registered_subprocess = live_children[0]
+                active_pid = int(registered_subprocess["pid"])
+                monitor_path = registered_subprocess.get("log_path") or monitor_path
+            child_started_at = None
+            if registered_subprocess:
+                child_started_at = _parse_started_at(
+                    registered_subprocess.get("started_at")
+                    or registered_subprocess.get("start_time")
+                )
+            started_at = child_started_at or datetime.fromisoformat(record.get("started_at", ""))
             _active_processes[task_id] = {
-                "pid": pid,
+                "pid": active_pid,
+                "worker_pid": record.get("worker_pid") or pid,
                 "task_id": task_id,
                 "task_dir": record.get("task_dir", task_dir),
                 "started_at": started_at,
                 "budget_minutes": int(record.get("budget_minutes", 0)),
                 "process": None,
                 "output_path": record.get("output_path", os.path.join(task_dir, "output.jsonl")),
+                "monitor_path": monitor_path,
+                "managed_subprocesses": _registered_subprocesses(record),
+                "registered_subprocess": registered_subprocess,
                 "killed_at": record.get("killed_at"),
                 "resource_limits": record.get("resource_limits") or _resource_limits(),
                 "resource_violation": record.get("resource_violation"),
@@ -923,11 +1088,12 @@ def kill(task_id: str) -> str:
     pid = entry["pid"]
 
     try:
-        if not _entry_process_is_alive(entry):
+        if not _promote_live_registered_subprocess_if_needed(task_id, entry):
             _active_processes[task_id]["running"] = False
             _active_processes[task_id]["killed_at"] = datetime.now()
             _write_process_record(_active_processes[task_id])
             return f"WARN: Task {task_id} (PID: {pid}) was already dead or stale"
+        pid = entry["pid"]
 
         proc = psutil.Process(pid)
         children = proc.children(recursive=True)
@@ -983,12 +1149,20 @@ def list_all() -> list[dict]:
     with _process_lock:
         items = list(_active_processes.items())
     for task_id, entry in items:
-        running = _entry_process_is_alive(entry)
+        running = _promote_live_registered_subprocess_if_needed(task_id, entry)
         entry["running"] = running
         elapsed = (datetime.now() - entry["started_at"]).total_seconds() / 60
 
         output_path = entry.get("output_path", os.path.join(entry["task_dir"], "output.jsonl"))
-        output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        monitor_path = entry.get("monitor_path") or output_path
+        output_size = os.path.getsize(monitor_path) if os.path.exists(monitor_path) else 0
+        registered_subprocess = entry.get("registered_subprocess")
+        log_age_seconds = None
+        log_stale = False
+        if registered_subprocess:
+            log_status = _registered_subprocess_log_status(entry["task_dir"], registered_subprocess)
+            log_age_seconds = log_status.get("log_age_seconds")
+            log_stale = bool(log_status.get("log_stale"))
 
         # ── Process health metrics ──────────────────────────────────
         cpu_percent = 0.0
@@ -1016,6 +1190,8 @@ def list_all() -> list[dict]:
             "elapsed_minutes": round(elapsed, 1),
             "budget_minutes": entry["budget_minutes"],
             "output_size": output_size,
+            "output_path": output_path,
+            "monitor_path": monitor_path,
             "cpu_percent": round(cpu_percent, 1),
             "avg_cpu_percent": round(aggregate["avg_cpu_percent"], 1),
             "memory_mb": round(memory_mb, 1),
@@ -1028,6 +1204,9 @@ def list_all() -> list[dict]:
             "avg_gpu_util_percent": None if aggregate["avg_gpu_util_percent"] is None else round(aggregate["avg_gpu_util_percent"], 1),
             "child_count": child_count,
             "resource_violation": entry.get("resource_violation"),
+            "registered_subprocess": registered_subprocess,
+            "log_age_seconds": None if log_age_seconds is None else round(log_age_seconds, 1),
+            "log_stale": log_stale,
         })
 
     return result
@@ -1083,7 +1262,7 @@ def _parse_started_at(value) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value))
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
 
@@ -1122,4 +1301,7 @@ def _entry_process_is_alive(entry: dict) -> bool:
                 return False
         except Exception:
             pass
+    registered = entry.get("registered_subprocess")
+    if registered and int(registered.get("pid", -1)) == pid:
+        return _registered_subprocess_alive(registered)
     return _is_alive(pid) and _pid_matches_started_at(pid, entry.get("started_at"))

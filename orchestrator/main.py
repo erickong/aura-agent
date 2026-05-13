@@ -515,6 +515,14 @@ def _sleep_until_next_wake(interval: int) -> None:
                 print(f"[Watchdog] Worker {worker['task_id']} stopped; waking early.")
                 remaining = 0
                 break
+            result_path = os.path.join(get_workspace_dir(), "tasks", worker["task_id"], "result.md")
+            if os.path.exists(result_path) and worker.get("registered_subprocess") and worker.get("log_stale"):
+                print(
+                    f"[Watchdog] {worker['task_id']} has result.md but its registered "
+                    "subprocess log is stale; waking orchestrator."
+                )
+                remaining = 0
+                break
 
 
 def _project_name_from_cwd() -> str:
@@ -752,26 +760,41 @@ def _reconcile_stopped_workers() -> dict:
 
         if output_size > 0:
             if has_result_md:
-                # Don't auto-complete — result.md might be premature
-                # (e.g. "training launched"). Let L1 verify in the next cycle.
-                print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
-                      f"with result.md. Letting L1 evaluate before marking complete.")
+                process_status = process_mgr.get_process_record_status(task_id)
+                live_children = process_status.get("live_subprocesses", [])
+                if live_children:
+                    print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
+                          "with result.md, but process.json still has a live registered subprocess. "
+                          "Keeping task active for L1 evaluation.")
+                else:
+                    print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
+                          "with result.md and no live registered subprocess. Marking completed.")
+                    try:
+                        state_mgr.update_task(
+                            task_id,
+                            "completed",
+                            "Worker stopped with result.md and process.json has no live registered subprocess.",
+                            f".aura/workspace/tasks/{task_id}/result.md")
+                        events["completed"].append(task_id)
+                    except Exception as state_err:
+                        print(f"    [WARN] Could not update task: {state_err}")
                 events["changed"] = True
-            else:
-                # Worker produced output but never wrote result.md — task is
-                # incomplete. Mark pending so L1 can decide whether to re-spawn
-                # or diagnose.
-                print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
-                      f"with output but no result.md. Marking pending for L1 evaluation.")
-                try:
-                    state_mgr.update_task(
-                        task_id,
-                        "pending",
-                        f"Worker stopped with output ({output_size} bytes) but no result.md; task is incomplete and needs continuation or diagnosis.",
-                        f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
-                    events["changed"] = True
-                except Exception as state_err:
-                    print(f"    [WARN] Could not update task: {state_err}")
+                process_mgr._active_processes.pop(task_id, None)
+                continue
+            # Worker produced output but never wrote result.md — task is
+            # incomplete. Mark pending so L1 can decide whether to re-spawn
+            # or diagnose.
+            print(f"\n  [STOPPED] Worker {task_id} finished (PID {worker['pid']}) "
+                  f"with output but no result.md. Marking pending for L1 evaluation.")
+            try:
+                state_mgr.update_task(
+                    task_id,
+                    "pending",
+                    f"Worker stopped with output ({output_size} bytes) but no result.md; task is incomplete and needs continuation or diagnosis.",
+                    f".aura/workspace/tasks/{task_id}/output.jsonl ({output_size} bytes)")
+                events["changed"] = True
+            except Exception as state_err:
+                print(f"    [WARN] Could not update task: {state_err}")
         else:
             print(f"\n  [CRASH] Worker {task_id} (PID {worker['pid']}) died with NO output.")
             try:
@@ -953,6 +976,15 @@ def _run_deep_reflection_cycle() -> dict:
     # Persist the timestamp so we don't re-trigger on the next cycle
     state = state_mgr.load_state()
     state["last_deep_review_time"] = datetime.now().isoformat()
+    if review_result and not review_result.get("error"):
+        review_text = str(review_result.get("review_text") or "")
+        state["pending_deep_review"] = {
+            "created_at": datetime.now().isoformat(),
+            "saved_path": review_result.get("saved_path", ""),
+            "recommendations": review_result.get("recommendations", [])[:5],
+            "excerpt": review_text[:1800],
+            "consumed": False,
+        }
     state_mgr.save_state(state)
 
     return {"cycle": cycle_num, "review_ran": True, **review_result}

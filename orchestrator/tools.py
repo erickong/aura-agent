@@ -465,6 +465,25 @@ def _check_output_jsonl_guard(abs_path: str) -> str | None:
         return None
     task_id = parts[0]
 
+    result_path = os.path.join(tasks_dir, task_id, "result.md")
+    process_path = os.path.join(tasks_dir, task_id, "process.json")
+    if os.path.exists(result_path):
+        try:
+            result_size = os.path.getsize(result_path)
+        except OSError:
+            result_size = 0
+        return (
+            f"BLOCKED: This task has result.md ({result_size} bytes). "
+            f"Never read output.jsonl/output.txt. Read process.json for "
+            f"registered subprocess state, and result.md only for the worker's "
+            f"completion claim. Paths: {process_path} and {result_path}"
+        )
+    return (
+        f"BLOCKED: Never read output.jsonl/output.txt for {task_id}. "
+        f"Use the workspace digest, process.json, and any registered subprocess "
+        f"log_path from process.json for lightweight monitoring. Path: {process_path}"
+    )
+
     # Check if result.md exists for this task
     result_path = os.path.join(tasks_dir, task_id, "result.md")
     if os.path.exists(result_path):
@@ -854,6 +873,7 @@ If this task involves a long-running subprocess, such as a long training job:
 1. Do not start subprocesses in detached or background mode (e.g. no `start_new_session=True`, `DETACHED_PROCESS`, `subprocess.Popen` with `shell=True` + `&`, `nohup`, or `screen`/`tmux`). Keep subprocesses attached so Aura can stop them when the orchestrator shuts down.
 2. Do not exit before the subprocess has reached a clear final state. Keep monitoring it until the task is completed, failed, or the time budget is exhausted.
 3. Only write `result.md` when the task is completed or failed with clear evidence. Do not write `result.md` merely because the subprocess was launched or because one training process exited.
+4. If you start a long-running child process, register it in this task directory's `process.json` under `managed_subprocesses` with `pid`, `started_at`, `kind`, and `log_path`. The `log_path` must point to the child process's own progress log, not `output.jsonl`.
 4. Save subprocess progress to `train_progress.log` and save checkpoints regularly, so training can be resumed after interruption.
 5. When starting, first check whether a previous run was interrupted. If resumable checkpoints/logs exist, try to resume training instead of starting from scratch. Preserve continuity of learning rate, optimizer state, scheduler state, epoch/step count, random seed, and other training parameters whenever possible.
 6. If the subprocess exits before the task goal is achieved, diagnose the reason. If appropriate, adjust parameters and restart or resume training instead of marking the task complete.
@@ -861,6 +881,7 @@ If this task involves a long-running subprocess, such as a long training job:
 
 ## Output Requirements
 - `result.md` is the task's FINAL outcome. ONLY create it when your whole task assigned in task.md is DONE. Do not create `result.md` if you have subprocesses still running (e.g. training). If you failed your job and cannot continue, you should also create this file.
+- Before creating `result.md`, verify that `process.json` has no live `managed_subprocesses` entry. A live registered child process means the task is still processing and must not be finalized.
 - When done, write a brief result summary to: result.md in the current directory. List all created files and what they contain.
 
 Do not inspect other task-file data directories under `.aura` for state,
@@ -945,7 +966,8 @@ def impl_list_running_tasks() -> str:
                       f"RAM avg/current: {t.get('avg_memory_percent', 0)}%/{t.get('memory_percent', 0)}% | "
                       f"GPU mem avg/current: {gpu_avg}/{gpu} | "
                       f"GPU util avg: {gpu_util} | "
-                      f"Output size: {t['output_size']} bytes"
+                      f"Monitor: {t.get('monitor_path') or '(none)'} | "
+                      f"Monitor size: {t['output_size']} bytes"
                       f"{violation}")
     return "\n".join(lines)
 

@@ -37,6 +37,7 @@ from .config import (
     AURA_EXPLICIT_PROMPT_CACHE,
     AURA_SKIP_HEALTHY_CYCLES,
     AURA_MAX_SKIPPED_CYCLES,
+    MAX_TOOL_CALLS_PER_CYCLE,
     MAX_CONCURRENT_TASKS,
     TOOL_CALL_BUDGET_NORMAL,
     TOOL_CALL_BUDGET_DIAGNOSTIC,
@@ -141,9 +142,14 @@ For each active task, evaluate:
 - Does the output actually contribute to the mission?
 
 **Output reading policy** (ENFORCED — read_file tool blocks violations):
-- If a task has `has_result_md: true`, read **result.md**. Do NOT attempt to read output.jsonl — the tool will block it. result.md is 300x smaller and contains the actual result.
-- For active tasks WITHOUT result.md, the Phase 2 monitoring line in the digest is sufficient. Do NOT read output.jsonl — the tool will block it. Only exception states (STUCK/LOOPING) include a raw tail for diagnosis.
+- Do not attempt to read output.jsonl or output.txt; the tool blocks these files in all task states.
+- For active tasks, the Phase 2 monitoring line plus process.json is sufficient. If a registered subprocess log is needed, use the `log_path` recorded in process.json.
 - Do not list_directory or read config files for completed tasks (has_result_md=true) unless the current cycle needs that specific evidence for a state-changing decision (e.g. replan, spawn a follow-up task).
+
+Additional hard output policy:
+- Never read output.jsonl or output.txt. The tool will block it.
+- For process state, read only the task's **process.json**. If it lists a live `managed_subprocesses` entry, the task is still processing even if result.md exists.
+- If a task has `has_result_md: true`, read **result.md** only as a completion claim, then verify process.json before any status change.
 
 ### 3. DECISION
 Based on evaluation, choose one or more:
@@ -338,6 +344,46 @@ def _format_phase2_summary(p2_result: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _pending_deep_review(state: dict) -> dict:
+    review = state.get("pending_deep_review") or {}
+    if not isinstance(review, dict) or review.get("consumed"):
+        return {}
+    return review
+
+
+def _format_pending_deep_review(state: dict) -> str:
+    review = _pending_deep_review(state)
+    if not review:
+        return "(none)"
+
+    recommendations = review.get("recommendations") or []
+    lines = [
+        "A deep reflection ran just before this normal cycle. Treat these as advisory inputs, not commands; decide whether to act with tools now.",
+        f"- saved_path: {review.get('saved_path') or '(not saved)'}",
+        f"- created_at: {review.get('created_at') or '(unknown)'}",
+    ]
+    if recommendations:
+        lines.append("- recommendations:")
+        for item in recommendations[:5]:
+            lines.append(f"  - {item}")
+
+    excerpt = str(review.get("excerpt") or "").strip()
+    if excerpt:
+        if len(excerpt) > 1800:
+            excerpt = excerpt[:1800].rstrip() + "\n... [truncated]"
+        lines.extend(["", "review excerpt:", "```markdown", excerpt, "```"])
+    return "\n".join(lines)
+
+
+def _consume_pending_deep_review() -> None:
+    state = state_mgr.load_state()
+    review = state.get("pending_deep_review")
+    if isinstance(review, dict) and not review.get("consumed"):
+        review["consumed"] = True
+        review["consumed_at"] = datetime.now().isoformat()
+        state_mgr.save_state(state)
+
+
 def _task_ids_for_workspace_snapshot(active_tasks: list, last_decisions: list) -> list[str]:
     ids: list[str] = []
     for task_id in active_tasks:
@@ -391,12 +437,7 @@ def _format_workspace_snapshot(task_ids: list[str], active_tasks: list) -> str:
             chunk.append("```")
 
         if task_id in active_tasks:
-            output_path = os.path.join(task_dir, "output.jsonl")
-            if not os.path.exists(output_path):
-                output_path = os.path.join(task_dir, "output.txt")
-            chunk.append("\nactive output tail:\n```text")
-            chunk.append(_read_tail_preview(output_path, max_lines=25, max_chars=2500))
-            chunk.append("```")
+            chunk.append("\nactive output tail: hidden; use process.json and registered subprocess log paths")
 
         chunks.append("\n".join(chunk))
 
@@ -445,6 +486,8 @@ def _format_workspace_digest(task_ids: list[str], active_tasks: list, p2_result:
         # ── result.md check (filesystem, always authoritative) ──────
         result_path = os.path.join(task_dir, "result.md")
         has_result = os.path.exists(result_path)
+        process_status = process_mgr.get_process_record_status(task_id)
+        live_subprocesses = process_status.get("live_subprocesses", [])
 
         # ── Determine task health category ──────────────────────────
         is_exception = is_stuck or is_looping or (has_no_delta and is_active and cpu < 0.5 and not has_result)
@@ -452,12 +495,26 @@ def _format_workspace_digest(task_ids: list[str], active_tasks: list, p2_result:
         lines = [f"### {task_id}"]
 
         # ── Status line ─────────────────────────────────────────────
-        if has_result:
-            lines.append(f"- status: completed (has result.md)")
+        if has_result and live_subprocesses:
+            lines.append("- status: completion_pending (result.md exists, registered subprocess still running)")
+        elif has_result:
+            lines.append("- status: result_ready (result.md exists, requires verification)")
         elif is_active:
             lines.append(f"- status: running")
         else:
             lines.append(f"- status: recent (no worker running)")
+
+        if process_status.get("exists"):
+            lines.append("- process_json: present")
+            for child in live_subprocesses[:3]:
+                age = child.get("log_age_seconds")
+                age_text = "unknown" if age is None else f"{age:.0f}s"
+                lines.append(
+                    f"- registered_subprocess: pid={child.get('pid')} "
+                    f"kind={child.get('kind', 'subprocess')} "
+                    f"log={child.get('log_path') or '(none)'} "
+                    f"log_age={age_text}"
+                )
 
         # ── Phase 2 monitoring (only for exception states without result.md) ──
         # Healthy workers: hide output.jsonl details to reduce LLM temptation.
@@ -469,6 +526,10 @@ def _format_workspace_digest(task_ids: list[str], active_tasks: list, p2_result:
             if pr.get("error_log_size", 0) > 0:
                 lines.append(f"- error_log_size: {pr['error_log_size']} (errors present)")
             lines.append(f"- has_result_md: True")
+            if live_subprocesses:
+                lines.append("- completion_gate: blocked by live registered subprocess")
+            else:
+                lines.append("- completion_gate: open; L1 must still verify acceptance criteria")
 
             lines.append("\nresult.md preview:\n```text")
             lines.append(_read_text_preview(result_path, max_chars=1000))
@@ -490,13 +551,7 @@ def _format_workspace_digest(task_ids: list[str], active_tasks: list, p2_result:
             if is_looping:
                 lines.append("- **LOOPING**")
 
-            # Raw output tail for live diagnosis
-            output_path = os.path.join(task_dir, "output.jsonl")
-            if not os.path.exists(output_path):
-                output_path = os.path.join(task_dir, "output.txt")
-            lines.append("\nactive output tail (exception state):\n```text")
-            lines.append(_read_tail_preview(output_path, max_lines=20, max_chars=2000))
-            lines.append("```")
+            lines.append("- raw_worker_output_tail: hidden; read process.json and registered log_path instead")
 
         else:
             # Healthy active worker without result.md — condensed Phase 2 summary
@@ -633,7 +688,8 @@ def build_context_message(
                              f"Running: {rt['running']} | "
                              f"Elapsed: {rt['elapsed_minutes']}min | "
                              f"Budget: {rt['budget_minutes']}min | "
-                             f"Output: {rt['output_size']} bytes")
+                             f"Monitor: {rt.get('monitor_path') or '(none)'} | "
+                             f"Monitor size: {rt['output_size']} bytes")
 
     last_decision_str = ""
     for d in last_decisions:
@@ -653,6 +709,7 @@ def build_context_message(
     )
 
     phase2_summary = _format_phase2_summary(p2_result)
+    deep_review_summary = _format_pending_deep_review(state)
 
     # ── Assemble: stable prefix first, then dynamic delta ─────────
     context = f"""## Stable Project Context
@@ -712,6 +769,9 @@ Planning needed: {planning_needed}
 
 ### Phase 2 Progress Signals
 {phase2_summary}
+
+### Pending Deep Reflection
+{deep_review_summary}
 
 ### Session Memory (current focus)
 ```text
@@ -802,6 +862,9 @@ def should_skip_l1_cycle(
     progress_results = p2_result.get("progress_results", [])
 
     # Stuck or looping → must call L1
+    if _pending_deep_review(state):
+        return False, "pending deep reflection recommendations"
+
     if any(p.get("is_stuck") or p.get("is_looping") for p in progress_results):
         return False, "worker stuck or looping"
 
@@ -911,6 +974,7 @@ def _run_phase2_eval(active_tasks: list, wake_change: dict | None = None) -> dic
             worker_health[w["task_id"]] = {
                 "cpu": w.get("cpu_percent", 0.0),
                 "memory_mb": w.get("memory_mb", 0.0),
+                "monitor_path": w.get("monitor_path"),
             }
 
         progress_results = []
@@ -918,8 +982,9 @@ def _run_phase2_eval(active_tasks: list, wake_change: dict | None = None) -> dic
             prev_size = _previous_output_sizes.get(task_id, 0)
             prev_hash = _previous_content_hashes.get(task_id, "")
             cpu = worker_health.get(task_id, {}).get("cpu", 0.0)
+            monitor_path = worker_health.get(task_id, {}).get("monitor_path")
 
-            result = evaluate_progress(task_id, prev_size, prev_hash, cpu)
+            result = evaluate_progress(task_id, prev_size, prev_hash, cpu, monitor_path=monitor_path)
             _previous_output_sizes[task_id] = result["output_size"]
             _previous_content_hashes[task_id] = result.get("content_hash", "")
             progress_results.append({"task_id": task_id, **result})
@@ -1137,6 +1202,28 @@ def run_cycle(wake_change: dict | None = None) -> dict:
 
     try:
         while True:
+            # Hard cap: prevent catastrophic $1+ cycles where the model
+            # loops on polling calls (list_directory / read_file / no_op)
+            # indefinitely without producing a text decision.
+            if api_call_count >= MAX_TOOL_CALLS_PER_CYCLE:
+                print(f"\n  [LIMIT] Hit {MAX_TOOL_CALLS_PER_CYCLE} API calls — forcing cycle end.")
+                elapsed = time.time() - cycle_start
+                _render_progress_safely("forced cycle end")
+                _update_session(cycle_num, tool_call_count, p2_result)
+                return {
+                    "cycle": cycle_num,
+                    "tool_calls": tool_call_count,
+                    "api_calls": api_call_count,
+                    "elapsed": round(elapsed, 2),
+                    "error": False,
+                    "activity_mode": p2_result["activity_mode"],
+                    "replan_requested": p2_result["replan_requested"],
+                    "review_requested": False,
+                    "safe_mode": _safe_mode,
+                    "token_usage": cycle_usage,
+                    "forced_l1_reason": f"max API calls ({MAX_TOOL_CALLS_PER_CYCLE}) reached",
+                }
+
             response = _call_api_with_retry(
                 client,
                 system=_ORCHESTRATOR_SYSTEM_PROMPT,
@@ -1164,6 +1251,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
 
                 # Update session memory
                 _update_session(cycle_num, tool_call_count, p2_result)
+                _consume_pending_deep_review()
 
                 review_requested = False
                 # Reflection is scheduled by main.py. Keeping the review

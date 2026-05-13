@@ -49,8 +49,8 @@ def _read_tail_lines(output_path: str, n: int = 40) -> list[str]:
         return []
 
 
-def _analyze_output_tail(task_dir: str) -> dict:
-    """Read the last ~50 lines of output.jsonl and extract simple signals.
+def _analyze_output_tail(task_dir: str, monitor_path: str | None = None) -> dict:
+    """Read the last ~50 lines of a lightweight monitor log.
 
     Returns:
         dict with:
@@ -60,7 +60,7 @@ def _analyze_output_tail(task_dir: str) -> dict:
           - unique_tool_names: set of distinct tool names seen in tail
           - is_looping: True if the same tool+args pair appears 8+ times
     """
-    output_path = os.path.join(task_dir, "output.jsonl")
+    output_path = monitor_path or os.path.join(task_dir, "output.jsonl")
     lines = _read_tail_lines(output_path, n=50)
 
     result = {
@@ -150,6 +150,7 @@ def evaluate_progress(
     previous_output_size: int = 0,
     previous_content_hash: str = "",
     process_cpu: float = 0.0,
+    monitor_path: str | None = None,
 ) -> dict:
     """Evaluate progress of a Layer 2 task with multi-signal analysis.
 
@@ -195,7 +196,7 @@ def evaluate_progress(
         return result
 
     # ── Signal 1: File size ──────────────────────────────────────────
-    output_path = os.path.join(task_dir, "output.jsonl")
+    output_path = monitor_path or os.path.join(task_dir, "output.jsonl")
     if os.path.exists(output_path):
         current_size = os.path.getsize(output_path)
         result["output_size"] = current_size
@@ -204,7 +205,7 @@ def evaluate_progress(
             result["has_output"] = True
 
     # ── Signal 2: Content analysis (tail hash + loop detection) ──────
-    tail = _analyze_output_tail(task_dir)
+    tail = _analyze_output_tail(task_dir, output_path)
     result["tail_analysis"] = tail
     result["content_hash"] = tail["tail_hash"]
 
