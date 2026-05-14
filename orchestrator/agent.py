@@ -27,6 +27,7 @@ from .config import (
     AURA_API_BASE_URL,
     AURA_API_MODEL,
     AURA_API_MAX_TOKENS,
+    AURA_LAYER2_BACKEND,
     API_RETRY_COUNT,
     API_RETRY_BASE_DELAY,
     API_TIMEOUT_SECONDS,
@@ -37,7 +38,7 @@ from .config import (
     AURA_EXPLICIT_PROMPT_CACHE,
     AURA_SKIP_HEALTHY_CYCLES,
     AURA_MAX_SKIPPED_CYCLES,
-    MAX_TOOL_CALLS_PER_CYCLE,
+    MAX_API_ROUNDS_PER_CYCLE,
     MAX_CONCURRENT_TASKS,
     TOOL_CALL_BUDGET_NORMAL,
     TOOL_CALL_BUDGET_DIAGNOSTIC,
@@ -74,10 +75,11 @@ except Exception as e:
     _phase_load_errors.append(f"phase2: {e}")
     print(f"[RESILIENCE] phase2.py failed to load: {e}. Using fallbacks.")
 
-    def evaluate_progress(task_id, previous_output_size=0):
+    def evaluate_progress(task_id, previous_output_size=0, previous_content_hash="", process_cpu=0.0, **kwargs):
         return {"active_score": 0.0, "has_output": False, "output_size": 0,
                 "output_delta": 0, "is_stuck": False, "stuck_cycles": 0,
-                "artifacts": [], "error_log_size": 0}
+                "artifacts": [], "new_artifacts": [], "error_log_size": 0,
+                "content_hash": "", "content_changed": False, "is_looping": False}
 
     def decision_matrix(progress, task_age_minutes, budget_remaining_minutes):
         return {"action": "continue_deeper", "confidence": 0.0,
@@ -103,10 +105,14 @@ except Exception as e:
         return {"review_text": "", "saved_path": "", "recommendations": [], "error": str(e)}
 
 
-_ORCHESTRATOR_SYSTEM_PROMPT = """You are Aura Agent's Global Orchestrator — the top-level controller of a two-layer autonomous agent system.
+_ORCHESTRATOR_SYSTEM_PROMPT = """You are the Global Orchestrator — the top-level controller of a two-layer autonomous agent system.
 
 ## Your Identity
 You are NOT a chatbot. You are a goal-completion engine. Your only purpose is to achieve the assigned mission. You wake up periodically, assess the situation, make decisions, and go back to sleep while Layer 2 workers execute your commands.
+
+## Layer 2 Backend
+Your Layer 2 workers run on: {layer2_backend}
+This determines how sub-tasks are executed (Claude Code CLI or ds-code).
 
 ## Your Operating Philosophy
 
@@ -176,7 +182,7 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 
 ## Rules
 
-- Maximum 2 concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the 2-task limit, preventing phantom in_progress tasks that have no worker.
+- Maximum {max_concurrent_tasks} concurrent Layer 2 tasks at any time. spawn_task automatically marks the task as in_progress — you do NOT need to call update_task_tree afterwards. update_task_tree will reject in_progress if already at the configured task limit, preventing phantom in_progress tasks that have no worker.
 - If a task returns to pending after the resource guard killed it once, retry it only with a smaller/safer plan: reduce batch size, epochs, model size, data subset, workers, or disable offload.
 - If a task is blocked because the resource guard killed it twice, prefer the generated resource-fix subtask. Use its result to continue the original goal if feasible. If the requirement is plainly impossible on the available hardware, record that with concrete evidence instead of retrying forever.
 - The code does not parse the user's task file into tasks. You own semantic planning: create, update, and archive task-tree nodes from the task-file content using tools.
@@ -186,7 +192,7 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 - Preserve and build on existing subtasks, evidence, and completed work. Do not re-plan from scratch just because the task file is broad or edited.
 - Treat completed tasks and result.md evidence as coverage for matching requirements; avoid repeating completed work unless the requirement text materially changed.
 - Do not mark tasks completed from task-file wording alone. Completion requires verifiable evidence, worker artifacts, or an explicit user request.
-- If there is free Layer 2 capacity and multiple independent pending requirements exist, start work on up to 2 of them instead of focusing only on the first item.
+- If there is free Layer 2 capacity and multiple independent pending requirements exist, start work on up to {max_concurrent_tasks} of them instead of focusing only on the first item.
 - If a task runs 12+ cycles with NO verifiable output → kill it or trigger replanning
 - If the entire project has no effective progress for several hours → comprehensive replanning
 - NEVER trust a task's self-report — check actual output evidence before changing status
@@ -202,6 +208,10 @@ Update the task tree, write important learnings to memory. Keep the progress rep
 The user message contains the current state snapshot, memory preview, progress preview, and task workspace summaries. Read it carefully, then use tools only for missing evidence or actions.
 
 Remember: You are the decider. Wake up, assess, decide, act, record, sleep."""
+_ORCHESTRATOR_SYSTEM_PROMPT = _ORCHESTRATOR_SYSTEM_PROMPT.format(
+    layer2_backend=AURA_LAYER2_BACKEND,
+    max_concurrent_tasks=MAX_CONCURRENT_TASKS,
+)
 
 
 def _format_wake_change_info(task_file: str, wake_change: dict) -> str:
@@ -227,30 +237,30 @@ def _format_wake_change_info(task_file: str, wake_change: dict) -> str:
     hints = []
     if added_req:
         hints.append(
-            f"**可能需要重新规划**: 检测到 {len(added_req)} 个新增/变更的任务需求。"
-            f"请读取任务文件，判断是否需要调整任务树（decompose、新增 T 节点、调整优先级）。"
+            f"**Replanning may be needed**: detected {len(added_req)} new or changed task requirement line(s). "
+            f"Read the task file and decide whether to adjust the task tree: decompose, add concrete task nodes, or reprioritize."
         )
     if removed_req:
         hints.append(
-            f"**需求已移除**: {len(removed_req)} 个任务项被删除。"
-            f"请检查是否有对应的 active task 需要标记为 obsolete。"
+            f"**Requirements removed**: {len(removed_req)} task item(s) were deleted. "
+            f"Check whether any corresponding active tasks should be archived as obsolete."
         )
     if added_info:
         hints.append(
-            f"**用户提供了新信息**: {len(added_info)} 行新的上下文信息。"
-            f"这些信息可能有助于当前进展——请读取并判断是否应记录到长期记忆 (write_memory)。"
+            f"**New user-provided context**: {len(added_info)} new information line(s). "
+            f"Read them and decide whether they should be persisted to long-term memory with write_memory."
         )
     if not hints:
-        hints.append("变更较小，可能无需调整计划。但仍建议读取任务文件确认。")
+        hints.append("The change appears small; a plan update may not be needed, but read the task file to confirm.")
 
     hints_text = "\n".join(f"  - {h}" for h in hints)
 
     return (
-        f"\n\n### ⚠️ 任务文件在本周期被修改\n"
-        f"**变更摘要**: {summary}\n"
-        f"**文件**: {task_file}\n\n"
-        f"**Diff 预览**:\n```diff\n{diff_preview}\n```\n\n"
-        f"**行动建议**:\n{hints_text}\n"
+        f"\n\n### Task File Changed This Wake\n"
+        f"**Change summary**: {summary}\n"
+        f"**File**: {task_file}\n\n"
+        f"**Diff preview**:\n```diff\n{diff_preview}\n```\n\n"
+        f"**Action hints**:\n{hints_text}\n"
     )
 
 
@@ -672,11 +682,11 @@ def build_context_message(
             change_info = get_file_change_info(task_file_path, PROJECTS_DIR, project_name)
             if change_info["is_changed"]:
                 changelog_info = (
-                    f"\n\n### ⚠️ 任务文件已变更\n"
-                    f"检测到 {task_file} 内容已更新！\n"
-                    f"上次处理哈希: {change_info['previous_hash'][:12]}...\n"
-                    f"当前哈希: {change_info['current_hash'][:12]}...\n"
-                    f"请读取任务文件内容，识别新增/变更的任务项，并更新任务树。\n"
+                    f"\n\n### Task File Changed\n"
+                    f"Detected updated content in {task_file}.\n"
+                    f"Previous processed hash: {change_info['previous_hash'][:12]}...\n"
+                    f"Current hash: {change_info['current_hash'][:12]}...\n"
+                    f"Read the task file, identify new or changed task items, and update the task tree.\n"
                 )
 
     # ── Dynamic delta section ─────────────────────────────────────
@@ -741,6 +751,8 @@ Current task batch prefix for new top-level categories: {state.get('task_batch',
 - Never spawn root or top-level category nodes (A1/B1). Workers go at level 3+ (A1.1).
 - Max {MAX_CONCURRENT_TASKS} concurrent workers.
 - Tool call budget: ~{TOOL_CALL_BUDGET_NORMAL} for normal cycles, ~{TOOL_CALL_BUDGET_PLANNING} for diagnostic/planning. Use fewer when possible — the budget is guidance, not a target.
+- Max L1 API rounds this wake cycle: {MAX_API_ROUNDS_PER_CYCLE}. Plan tool use within this limit.
+- `no_op` is terminal for the current wake cycle: call it only when no more L1 decisions are needed this cycle.
 - Every status change needs reason AND evidence.
 
 ---
@@ -795,6 +807,12 @@ Now assess the situation and decide what to do.
 - If there are active tasks or running processes, evaluate them from the Phase 2 signals and workspace snapshot first; read only the specific missing file if needed.
 - If there are no active tasks, no running processes, no pending tasks (pending={pending_count}), no task-file change, and Planning needed is False, use no_op without extra file reads.
 - Otherwise take action (spawn, kill, update, decompose, write_memory, or no_op) and record evidence for any status change."""
+
+    context += f"\n\n## Layer 2 Backend\n- Backend: {AURA_LAYER2_BACKEND}"
+    if AURA_LAYER2_BACKEND == "claude":
+        context += "\n- Workers run via Claude Code CLI (claude -p @task.md)"
+    elif AURA_LAYER2_BACKEND == "ds_code":
+        context += "\n- Workers run via ds-code CLI (ds-code run)"
 
     return context
 
@@ -975,16 +993,27 @@ def _run_phase2_eval(active_tasks: list, wake_change: dict | None = None) -> dic
                 "cpu": w.get("cpu_percent", 0.0),
                 "memory_mb": w.get("memory_mb", 0.0),
                 "monitor_path": w.get("monitor_path"),
+                "elapsed_minutes": w.get("elapsed_minutes", 0.0),
+                "budget_minutes": w.get("budget_minutes", 0.0),
             }
 
         progress_results = []
         for task_id in active_tasks:
             prev_size = _previous_output_sizes.get(task_id, 0)
             prev_hash = _previous_content_hashes.get(task_id, "")
-            cpu = worker_health.get(task_id, {}).get("cpu", 0.0)
-            monitor_path = worker_health.get(task_id, {}).get("monitor_path")
+            health = worker_health.get(task_id, {})
+            cpu = health.get("cpu", 0.0)
+            monitor_path = health.get("monitor_path")
 
-            result = evaluate_progress(task_id, prev_size, prev_hash, cpu, monitor_path=monitor_path)
+            result = evaluate_progress(
+                task_id,
+                prev_size,
+                prev_hash,
+                cpu,
+                monitor_path=monitor_path,
+                task_age_minutes=health.get("elapsed_minutes", 0.0),
+                budget_minutes=health.get("budget_minutes", 0.0),
+            )
             _previous_output_sizes[task_id] = result["output_size"]
             _previous_content_hashes[task_id] = result.get("content_hash", "")
             progress_results.append({"task_id": task_id, **result})
@@ -1026,7 +1055,7 @@ def _run_phase2_eval(active_tasks: list, wake_change: dict | None = None) -> dic
             for t in active_tasks
         )
 
-        # R7: 检测用户是否在 task file 中添加了新的需求
+        # R7: detect whether the user added new requirements to the task file.
         has_new_requirements = (
             wake_change is not None
             and wake_change.get("changed")
@@ -1205,8 +1234,8 @@ def run_cycle(wake_change: dict | None = None) -> dict:
             # Hard cap: prevent catastrophic $1+ cycles where the model
             # loops on polling calls (list_directory / read_file / no_op)
             # indefinitely without producing a text decision.
-            if api_call_count >= MAX_TOOL_CALLS_PER_CYCLE:
-                print(f"\n  [LIMIT] Hit {MAX_TOOL_CALLS_PER_CYCLE} API calls — forcing cycle end.")
+            if api_call_count >= MAX_API_ROUNDS_PER_CYCLE:
+                print(f"\n  [LIMIT] Hit {MAX_API_ROUNDS_PER_CYCLE} API rounds — forcing cycle end.")
                 elapsed = time.time() - cycle_start
                 _render_progress_safely("forced cycle end")
                 _update_session(cycle_num, tool_call_count, p2_result)
@@ -1221,7 +1250,7 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                     "review_requested": False,
                     "safe_mode": _safe_mode,
                     "token_usage": cycle_usage,
-                    "forced_l1_reason": f"max API calls ({MAX_TOOL_CALLS_PER_CYCLE}) reached",
+                    "forced_l1_reason": f"max API rounds ({MAX_API_ROUNDS_PER_CYCLE}) reached",
                 }
 
             response = _call_api_with_retry(
@@ -1299,6 +1328,29 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                     "tool_use_id": tool_use.id,
                     "content": result_str,
                 })
+
+                if tool_name == "no_op":
+                    print("\n[Orchestrator] no_op received; ending current wake cycle.")
+                    if cycle_usage:
+                        print(f"  [Tokens] {format_cycle_stats(cycle_usage)}")
+                    _render_progress_safely("no_op")
+                    _update_session(cycle_num, tool_call_count, p2_result)
+                    _consume_pending_deep_review()
+                    elapsed = time.time() - cycle_start
+                    return {
+                        "cycle": cycle_num,
+                        "tool_calls": tool_call_count,
+                        "api_calls": api_call_count,
+                        "elapsed": round(elapsed, 2),
+                        "error": False,
+                        "activity_mode": p2_result["activity_mode"],
+                        "replan_requested": p2_result["replan_requested"],
+                        "review_requested": False,
+                        "safe_mode": _safe_mode,
+                        "token_usage": cycle_usage,
+                        "forced_l1_reason": forced_l1_reason,
+                        "terminated_by": "no_op",
+                    }
 
             messages.append({
                 "role": "user",

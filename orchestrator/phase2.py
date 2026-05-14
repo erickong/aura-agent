@@ -130,19 +130,22 @@ def _analyze_output_tail(task_dir: str, monitor_path: str | None = None) -> dict
     return result
 
 
-def _detect_looping(task_id: str, tail_hash: str, lines: list[str]) -> bool:
-    """Detect if the worker is writing a tight loop of identical output.
-
-    Compares current tail hash with the previous cycle's hash. If the
-    hashes match AND the file size hasn't changed, it's a loop.
-    """
+def _record_tail_stagnation(task_id: str, tail_hash: str) -> int:
+    """Return how many consecutive Phase 2 checks saw the same tail hash."""
     prev = _last_tail_state.get(task_id, {})
     prev_hash = prev.get("tail_hash", "")
-    # Update cache
-    _last_tail_state[task_id] = {"tail_hash": tail_hash}
-    if not prev_hash:
-        return False
-    return tail_hash == prev_hash
+    prev_count = int(prev.get("stagnant_count", 0))
+    if not tail_hash:
+        count = 0
+    elif prev_hash and tail_hash == prev_hash:
+        count = prev_count + 1
+    else:
+        count = 0
+    _last_tail_state[task_id] = {
+        "tail_hash": tail_hash,
+        "stagnant_count": count,
+    }
+    return count
 
 
 def evaluate_progress(
@@ -151,6 +154,8 @@ def evaluate_progress(
     previous_content_hash: str = "",
     process_cpu: float = 0.0,
     monitor_path: str | None = None,
+    task_age_minutes: float = 0.0,
+    budget_minutes: float = 0.0,
 ) -> dict:
     """Evaluate progress of a Layer 2 task with multi-signal analysis.
 
@@ -190,6 +195,8 @@ def evaluate_progress(
         "error_log_size": 0,
         "is_looping": False,
         "tail_analysis": {},
+        "stagnant_tail_cycles": 0,
+        "stuck_grace_minutes": 0.0,
     }
 
     if not os.path.isdir(task_dir):
@@ -212,11 +219,8 @@ def evaluate_progress(
     if previous_content_hash and tail["tail_hash"]:
         result["content_changed"] = (tail["tail_hash"] != previous_content_hash)
 
-    result["is_looping"] = tail.get("is_looping", False)
-
-    # Also check cross-cycle hash stagnation
-    if _detect_looping(task_id, tail["tail_hash"], []):
-        result["is_looping"] = True
+    raw_tail_loop = bool(tail.get("is_looping", False))
+    result["stagnant_tail_cycles"] = _record_tail_stagnation(task_id, tail["tail_hash"])
 
     # ── Signal 3: Error log ──────────────────────────────────────────
     error_path = os.path.join(task_dir, "error.log")
@@ -241,6 +245,22 @@ def evaluate_progress(
     _last_artifacts[task_id] = current_artifacts
 
     # ── Composite active_score ───────────────────────────────────────
+    no_output_growth = result["output_delta"] == 0
+    tail_stagnant_enough = result["stagnant_tail_cycles"] >= STUCK_THRESHOLD_CYCLES
+    no_new_artifacts = not result["new_artifacts"]
+    budget_grace = (float(budget_minutes) * 0.5) if budget_minutes else 10.0
+    grace_minutes = max(10.0, budget_grace)
+    result["stuck_grace_minutes"] = grace_minutes
+    past_grace = float(task_age_minutes or 0.0) >= grace_minutes
+    gated_stagnation = (
+        no_output_growth
+        and tail_stagnant_enough
+        and no_new_artifacts
+        and past_grace
+    )
+    result["is_stuck"] = gated_stagnation
+    result["is_looping"] = raw_tail_loop and gated_stagnation
+
     score = 0.0
     if result["has_output"]:
         score += 0.2
@@ -264,23 +284,8 @@ def evaluate_progress(
 
     result["active_score"] = max(0.0, min(1.0, score))
 
-    # ── Stuck detection: multi-signal ────────────────────────────────
-    # A task is stuck ONLY when ALL signals agree:
-    #   - No file size growth
-    #   - No content change (tail hash same as last cycle)
-    #   - No new artifacts
-    #   - CPU is near zero (process idle, not computing)
-    #
-    # If CPU > 0 but no output changes, the worker is likely doing a long
-    # computation — NOT stuck, just slow to report.
-    size_stagnant = (result["output_delta"] == 0 and result["output_size"] == previous_output_size)
-    content_stagnant = not result["content_changed"]
-    no_new_artifacts = not result["new_artifacts"]
-    cpu_idle = process_cpu < 0.5  # Less than 0.5% CPU = effectively idle
-
-    if size_stagnant and content_stagnant and no_new_artifacts and cpu_idle:
-        result["is_stuck"] = True
-
+    # Stuck/looping is gated above by monitor-log stagnation, repeated tail
+    # hash, no new artifacts, and a minimum age grace period.
     return result
 
 

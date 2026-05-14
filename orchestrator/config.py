@@ -259,7 +259,10 @@ TOOL_CALL_BUDGET_NORMAL = _get_int("AURA_TOOL_CALL_BUDGET_NORMAL", "12")
 TOOL_CALL_BUDGET_DIAGNOSTIC = _get_int("AURA_TOOL_CALL_BUDGET_DIAGNOSTIC", "40")
 TOOL_CALL_BUDGET_PLANNING = _get_int("AURA_TOOL_CALL_BUDGET_PLANNING", "40")
 
-# Hard limit on API calls per cycle. If the orchestrator exceeds this, the
-# cycle aborts with a forced text response. Prevents catastrophic $1+ cycles
-# where the model loops on polling read/list/no_op calls indefinitely.
-MAX_TOOL_CALLS_PER_CYCLE = _get_int("AURA_MAX_TOOL_CALLS_PER_CYCLE", "20")
+# Hard limit on L1 API rounds per wake cycle. This is intentionally an API
+# round cap, not a tool-call cap: L1 should plan its tool usage within a cycle
+# and finish with no_op or a text decision.
+MAX_API_ROUNDS_PER_CYCLE = _get_int(
+    "AURA_MAX_API_ROUNDS_PER_CYCLE",
+    _get("AURA_MAX_TOOL_CALLS_PER_CYCLE", "20"),
+)

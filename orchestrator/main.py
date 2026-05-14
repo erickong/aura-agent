@@ -394,7 +394,6 @@ from orchestrator.changelog import (
     check_task_file_on_wake,
     save_task_file_snapshot,
 )
-from orchestrator.agent_patches import apply_patches, get_startup_banner
 from orchestrator.cli_extensions import register_commands
 from orchestrator.task_reporter import generate_task_summary
 from orchestrator.token_tracker import accumulate_session, format_session_display
@@ -411,8 +410,19 @@ except ImportError as e:
     def review_cycle(force=False):
         return {"review_text": "", "saved_path": "", "recommendations": [], "error": str(e)}
 
-# -- Apply R1 agent patches (system prompt + Layer 2 backend display) --
-patch_results = apply_patches()
+
+def _get_startup_banner() -> str:
+    """Return the startup banner showing Layer 2 backend info."""
+    backend_display = {
+        "claude": "Claude Code CLI (Anthropic)",
+        "ds_code": "ds-code CLI (DeepSeek)",
+    }.get(AURA_LAYER2_BACKEND, AURA_LAYER2_BACKEND)
+
+    return (
+        f"[INFO] Layer 2 Backend: {backend_display}\n"
+        f"[INFO] Layer 2 workers will execute tasks via: {AURA_LAYER2_BACKEND}"
+    )
+
 
 _running = True
 _shutdown_requested = False
@@ -998,7 +1008,7 @@ def cmd_start(args):
     _crash_log_file = open(os.path.join(DATA_DIR, "crash.log"), "a", buffering=1)
     faulthandler.enable(_crash_log_file, all_threads=True)
 
-    print(get_startup_banner())
+    print(_get_startup_banner())
     global _running, _shutdown_requested, _consecutive_api_errors, _llm_dead, _process_start_time
 
     task_file = args.task_file

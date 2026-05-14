@@ -1919,7 +1919,7 @@ class TestContextBuilding:
         }
 
         ctx = build_context_message(wake_change=wake_change)
-        assert "任务文件在本周期被修改" in ctx
+        assert "Task File Changed This Wake" in ctx
         assert "New Task" in ctx
 
     def test_format_workspace_snapshot(self, task_file_simple,
@@ -1963,8 +1963,9 @@ class TestPhase2:
         assert result["has_output"] is False
         # Score is low but not exactly zero: no error log gives +0.05
         assert result["active_score"] < 0.1
-        # No output + CPU 0 → stuck (all signals agree)
-        assert result["is_stuck"] is True
+        # Fresh quiet tasks stay below the stuck threshold until the age
+        # grace and repeated tail-stagnation checks are both satisfied.
+        assert result["is_stuck"] is False
 
     def test_evaluate_progress_with_cpu_not_stuck(self, patched_config):
         from orchestrator.phase2 import evaluate_progress
@@ -1977,6 +1978,34 @@ class TestPhase2:
         result = evaluate_progress("computing_task", 0, "", 10.0)
         assert result["is_stuck"] is False
         assert result["active_score"] > 0
+
+    def test_evaluate_progress_stuck_requires_grace_and_repeated_tail(self, patched_config):
+        from orchestrator.phase2 import evaluate_progress
+        from orchestrator.config import get_workspace_dir, STUCK_THRESHOLD_CYCLES
+
+        task_dir = os.path.join(get_workspace_dir(), "tasks", "stagnant_task")
+        os.makedirs(task_dir, exist_ok=True)
+        output_path = os.path.join(task_dir, "output.jsonl")
+        Path(output_path).write_text('{"type":"assistant","message":{"content":[]}}\n', encoding="utf-8")
+
+        first = evaluate_progress("stagnant_task", 0, "", 0.0, task_age_minutes=20, budget_minutes=20)
+        previous_size = first["output_size"]
+        previous_hash = first["content_hash"]
+        result = first
+        for _ in range(STUCK_THRESHOLD_CYCLES):
+            result = evaluate_progress(
+                "stagnant_task",
+                previous_size,
+                previous_hash,
+                0.0,
+                task_age_minutes=20,
+                budget_minutes=20,
+            )
+            previous_hash = result["content_hash"]
+
+        assert result["output_delta"] == 0
+        assert result["stagnant_tail_cycles"] >= STUCK_THRESHOLD_CYCLES
+        assert result["is_stuck"] is True
 
     def test_check_replan_needed_no_progress(self):
         from orchestrator.phase2 import check_replan_needed
@@ -2195,3 +2224,41 @@ class TestResourceGuard:
         assert env["AURA_WORKER_FORBID_OFFLOAD"] == "1"
         assert env["TF_FORCE_GPU_ALLOW_GROWTH"] == "true"
         assert "AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT" in env
+
+
+class TestTokenPricing:
+    """Test token usage cost estimation."""
+
+    def test_deepseek_usage_fields_override_anthropic_compatible_provider(self):
+        from orchestrator import token_tracker
+
+        usage = {
+            "input_tokens": 6361,
+            "output_tokens": 4764,
+            "prompt_cache_hit_tokens": 69760,
+            "prompt_cache_miss_tokens": 0,
+        }
+
+        text = token_tracker.format_cycle_stats(usage)
+
+        assert "~$0.0184" in text
+        assert "$0.3782" not in text
+
+    def test_session_cost_uses_deepseek_prices_for_prompt_cache_fields(self):
+        from orchestrator import token_tracker
+
+        token_tracker._session_records.clear()
+        token_tracker.accumulate_session(
+            1,
+            {
+                "input_tokens": 6361,
+                "output_tokens": 4764,
+                "prompt_cache_hit_tokens": 69760,
+                "prompt_cache_miss_tokens": 0,
+            },
+        )
+
+        stats = token_tracker.get_session_stats()
+
+        assert stats["provider"] == "deepseek"
+        assert stats["total_cost"] == pytest.approx(0.018406, rel=1e-3)

@@ -50,7 +50,7 @@ def _state_content_hash(state: dict) -> str:
 
 
 def render_progress() -> str:
-    """Render the full 进展.md from current state and return the content.
+    """Render the full progress.md from current state and return the content.
 
     Skip re-rendering (T0 optimization) if neither the state content
     (task tree + decisions) nor the template file has changed since
@@ -104,7 +104,7 @@ def render_progress() -> str:
             pass
 
     content = template.render(
-        mission=state.get("mission", "未设定"),
+        mission=state.get("mission", "not set"),
         project_context=state.get("project_context", {}),
         updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total_cycles=state.get("total_cycles", 0),

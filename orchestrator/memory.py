@@ -140,10 +140,10 @@ def append_memory(mem_type: str, content: str) -> str:
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     type_labels = {
-        "fact": "事实",
-        "lesson": "教训",
-        "pattern": "模式",
-        "decision": "决策",
+        "fact": "Fact",
+        "lesson": "Lesson",
+        "pattern": "Pattern",
+        "decision": "Decision",
     }
     label = type_labels.get(mem_type, mem_type)
 

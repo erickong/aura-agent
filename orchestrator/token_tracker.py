@@ -33,11 +33,6 @@ def _get_prices():
 
 
 # Anthropic Claude pricing (fallback estimates — not configurable yet)
-_CLAUDE_CACHE_WRITE_PRICE = 3.75  # per 1M tokens
-_CLAUDE_CACHE_READ_PRICE = 0.30   # per 1M tokens
-_CLAUDE_INPUT_PRICE = 15.0        # per 1M tokens
-_CLAUDE_OUTPUT_PRICE = 75.0       # per 1M tokens
-
 # ── Storage ──────────────────────────────────────────────────────────
 
 # Lazy path resolution — uses config.DATA_DIR after imports are ready.
@@ -93,6 +88,66 @@ def _detect_provider() -> str:
     if "anthropic" in AURA_API_BASE_URL.lower():
         return "anthropic"
     return "unknown"
+
+
+def _usage_token_parts(usage: dict) -> dict[str, int | bool]:
+    """Normalize usage fields into the configured price buckets.
+
+    Pricing is intentionally provider-agnostic. Cache hits use
+    AURA_TOKEN_PRICE_CACHE_HIT, full-price input/cache misses use
+    AURA_TOKEN_PRICE_CACHE_MISS, and output uses AURA_TOKEN_PRICE_OUTPUT.
+    """
+    inp = int(usage.get("input_tokens", 0) or 0)
+    out = int(usage.get("output_tokens", 0) or 0)
+
+    has_prompt_cache = (
+        "prompt_cache_hit_tokens" in usage
+        or "prompt_cache_miss_tokens" in usage
+    )
+    has_anthropic_cache = (
+        "cache_read_input_tokens" in usage
+        or "cache_creation_input_tokens" in usage
+    )
+
+    if has_prompt_cache:
+        cache_hit = int(usage.get("prompt_cache_hit_tokens", 0) or 0)
+        cache_miss = int(usage.get("prompt_cache_miss_tokens", 0) or 0)
+        cache_read = 0
+        cache_creation = 0
+        has_cache = bool(cache_hit or cache_miss)
+    elif has_anthropic_cache:
+        cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        cache_hit = cache_read
+        cache_miss = cache_creation + inp
+        has_cache = bool(cache_hit or cache_creation)
+    else:
+        cache_hit = 0
+        cache_miss = inp
+        cache_read = 0
+        cache_creation = 0
+        has_cache = False
+
+    return {
+        "input": inp,
+        "output": out,
+        "cache_hit": cache_hit,
+        "cache_miss": cache_miss,
+        "cache_read": cache_read,
+        "cache_creation": cache_creation,
+        "has_cache": has_cache,
+    }
+
+
+def _estimate_usage_cost(usage: dict) -> float:
+    """Estimate cost using only configured token prices."""
+    cache_hit_price, cache_miss_price, output_price = _get_prices()
+    parts = _usage_token_parts(usage)
+    return (
+        (int(parts["cache_hit"]) / 1_000_000) * cache_hit_price
+        + (int(parts["cache_miss"]) / 1_000_000) * cache_miss_price
+        + (int(parts["output"]) / 1_000_000) * output_price
+    )
 
 
 def _ensure_loaded() -> None:
@@ -240,22 +295,20 @@ def get_stats() -> dict:
         source = rec.get("source", "unknown")
         usage = rec.get("usage", {})
 
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
+        parts = _usage_token_parts(usage)
+        inp = int(parts["input"])
+        out = int(parts["output"])
+        cache_hit = int(parts["cache_hit"])
+        cache_miss = int(parts["cache_miss"])
+        cache_read = int(parts["cache_read"])
+        cache_creation = int(parts["cache_creation"])
 
         total_input += inp
         total_output += out
-
-        if provider == "deepseek":
-            hit = usage.get("prompt_cache_hit_tokens", 0)
-            miss = usage.get("prompt_cache_miss_tokens", 0)
-            total_cache_hit += hit
-            total_cache_miss += miss
-        else:
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_creation = usage.get("cache_creation_input_tokens", 0)
-            total_cache_read += cache_read
-            total_cache_creation += cache_creation
+        total_cache_hit += cache_hit
+        total_cache_miss += cache_miss
+        total_cache_read += cache_read
+        total_cache_creation += cache_creation
 
         if source not in by_source:
             by_source[source] = {
@@ -269,42 +322,27 @@ def get_stats() -> dict:
         bs["calls"] += 1
         bs["input_tokens"] += inp
         bs["output_tokens"] += out
-        if provider == "deepseek":
-            bs["cache_hit_tokens"] += usage.get("prompt_cache_hit_tokens", 0)
-            bs["cache_miss_tokens"] += usage.get("prompt_cache_miss_tokens", 0)
-        else:
-            bs["cache_hit_tokens"] += usage.get("cache_read_input_tokens", 0)
-            bs["cache_miss_tokens"] += usage.get("cache_creation_input_tokens", 0)
+        bs["cache_hit_tokens"] += cache_hit
+        bs["cache_miss_tokens"] += cache_miss
 
-    if provider == "deepseek":
-        cache_hit_price, cache_miss_price, output_price = _get_prices()
-        estimated_cost = (
-            (total_cache_hit / 1_000_000) * cache_hit_price
-            + (total_cache_miss / 1_000_000) * cache_miss_price
-            + (total_output / 1_000_000) * output_price
-        )
-        full_input_cost = (total_input / 1_000_000) * cache_miss_price
-        estimated_saved = full_input_cost - (
-            (total_cache_hit / 1_000_000) * cache_hit_price
-            + (total_cache_miss / 1_000_000) * cache_miss_price
-        )
-        total_cache = total_cache_hit
-    else:
-        estimated_cost = (
-            (total_cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
-            + (total_cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
-            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
-            + (total_output / 1_000_000) * _CLAUDE_OUTPUT_PRICE
-        )
-        full_input_cost = (total_input / 1_000_000) * _CLAUDE_INPUT_PRICE
-        estimated_saved = full_input_cost - (
-            (total_cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
-            + (total_cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
-            + (max(0, total_input - total_cache_read - total_cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
-        )
-        total_cache = total_cache_read
+    cache_hit_price, cache_miss_price, output_price = _get_prices()
+    estimated_cost = (
+        (total_cache_hit / 1_000_000) * cache_hit_price
+        + (total_cache_miss / 1_000_000) * cache_miss_price
+        + (total_output / 1_000_000) * output_price
+    )
+    full_input_cost = ((total_cache_hit + total_cache_miss) / 1_000_000) * cache_miss_price
+    estimated_saved = full_input_cost - (
+        (total_cache_hit / 1_000_000) * cache_hit_price
+        + (total_cache_miss / 1_000_000) * cache_miss_price
+    )
+    total_cache = total_cache_hit
 
-    cache_hit_rate = (total_cache / max(total_input, 1)) if total_input > 0 else 0.0
+    cache_hit_rate = (
+        total_cache / max(total_cache_hit + total_cache_miss, 1)
+        if (total_cache_hit or total_cache_miss)
+        else 0.0
+    )
 
     return {
         "total_calls": len(records),
@@ -413,40 +451,21 @@ def format_cycle_stats(usage: dict) -> str:
     if not usage:
         return ""
 
-    provider = _detect_provider()
-    hit = usage.get("prompt_cache_hit_tokens", 0) or usage.get("cache_read_input_tokens", 0)
-    miss = usage.get("prompt_cache_miss_tokens", 0)
-    inp = usage.get("input_tokens", 0)
-    out = usage.get("output_tokens", 0)
+    parts = _usage_token_parts(usage)
+    hit = int(parts["cache_hit"])
+    miss = int(parts["cache_miss"])
+    inp = int(parts["input"])
+    out = int(parts["output"])
+    cost = _estimate_usage_cost(usage)
 
-    if provider == "deepseek" and (hit or miss):
-        cache_hit_price, cache_miss_price, output_price = _get_prices()
+    if parts["has_cache"]:
         hit_rate = hit / max(hit + miss, 1)
-        cost = (
-            (hit / 1_000_000) * cache_hit_price
-            + (miss / 1_000_000) * cache_miss_price
-            + (out / 1_000_000) * output_price
-        )
         return (
             f"tokens: in={inp:,} out={out:,} | "
             f"cache: hit={hit:,} miss={miss:,} ({hit_rate:.0%}) | "
             f"~${cost:.4f}"
         )
-    elif provider == "anthropic" and hit:
-        cost = (
-            (hit / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
-            + (usage.get("cache_creation_input_tokens", 0) / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
-            + (out / 1_000_000) * _CLAUDE_OUTPUT_PRICE
-        )
-        return (
-            f"tokens: in={inp:,} out={out:,} | "
-            f"cache: hit={hit:,} | "
-            f"~${cost:.4f}"
-        )
-    else:
-        cache_hit_price, cache_miss_price, output_price = _get_prices()
-        cost = (inp / 1_000_000) * cache_miss_price + (out / 1_000_000) * output_price
-        return f"tokens: in={inp:,} out={out:,} | ~${cost:.4f}"
+    return f"tokens: in={inp:,} out={out:,} | ~${cost:.4f}"
 
 
 # ── Session-level tracking (in-memory only, resets each process) ───
@@ -494,7 +513,6 @@ def get_session_stats() -> dict:
         }
 
     provider = _detect_provider()
-    cache_hit_price, cache_miss_price, output_price = _get_prices()
 
     normal_cycles = 0
     deep_reflection_cycles = 0
@@ -515,32 +533,16 @@ def get_session_stats() -> dict:
             skipped_cycles += 1
             continue
 
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
+        parts = _usage_token_parts(usage)
+        inp = int(parts["input"])
+        out = int(parts["output"])
+        hit = int(parts["cache_hit"])
+        miss = int(parts["cache_miss"])
         total_input += inp
         total_output += out
-
-        if provider == "deepseek":
-            hit = usage.get("prompt_cache_hit_tokens", 0)
-            miss = usage.get("prompt_cache_miss_tokens", 0)
-            total_cache_hit += hit
-            total_cache_miss += miss
-            cost = (
-                (hit / 1_000_000) * cache_hit_price
-                + (miss / 1_000_000) * cache_miss_price
-                + (out / 1_000_000) * output_price
-            )
-        else:
-            cache_read = usage.get("cache_read_input_tokens", 0)
-            cache_creation = usage.get("cache_creation_input_tokens", 0)
-            total_cache_hit += cache_read
-            total_cache_miss += cache_creation
-            cost = (
-                (cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
-                + (cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
-                + (max(0, inp - cache_read - cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
-                + (out / 1_000_000) * _CLAUDE_OUTPUT_PRICE
-            )
+        total_cache_hit += hit
+        total_cache_miss += miss
+        cost = _estimate_usage_cost(usage)
 
         total_cost += cost
 
@@ -584,32 +586,11 @@ def format_session_display(current_usage: dict | None = None,
     """
     stats = get_session_stats()
     provider = stats.get("provider", "unknown")
-    cache_hit_price, cache_miss_price, output_price = _get_prices()
 
     # Compute current-cycle cost
     current_cost = 0.0
     if current_usage:
-        hit = current_usage.get("prompt_cache_hit_tokens", 0) or current_usage.get("cache_read_input_tokens", 0)
-        miss = current_usage.get("prompt_cache_miss_tokens", 0)
-        out_cur = current_usage.get("output_tokens", 0)
-        inp_cur = current_usage.get("input_tokens", 0)
-        if provider == "deepseek" and (hit or miss):
-            current_cost = (
-                (hit / 1_000_000) * cache_hit_price
-                + (miss / 1_000_000) * cache_miss_price
-                + (out_cur / 1_000_000) * output_price
-            )
-        elif provider == "anthropic":
-            cache_read = current_usage.get("cache_read_input_tokens", 0)
-            cache_creation = current_usage.get("cache_creation_input_tokens", 0)
-            current_cost = (
-                (cache_read / 1_000_000) * _CLAUDE_CACHE_READ_PRICE
-                + (cache_creation / 1_000_000) * _CLAUDE_CACHE_WRITE_PRICE
-                + (max(0, inp_cur - cache_read - cache_creation) / 1_000_000) * _CLAUDE_INPUT_PRICE
-                + (out_cur / 1_000_000) * _CLAUDE_OUTPUT_PRICE
-            )
-        else:
-            current_cost = (inp_cur / 1_000_000) * cache_miss_price + (out_cur / 1_000_000) * output_price
+        current_cost = _estimate_usage_cost(current_usage)
 
     s = stats  # shorthand
     label = "DEEP REFLECTION" if source == "deep_reflection" else "CYCLE"
@@ -622,12 +603,13 @@ def format_session_display(current_usage: dict | None = None,
     ]
 
     if current_usage:
-        hit = current_usage.get("prompt_cache_hit_tokens", 0) or current_usage.get("cache_read_input_tokens", 0)
-        miss_cur = current_usage.get("prompt_cache_miss_tokens", 0)
-        inp = current_usage.get("input_tokens", 0)
-        out = current_usage.get("output_tokens", 0)
+        parts = _usage_token_parts(current_usage)
+        hit = int(parts["cache_hit"])
+        miss_cur = int(parts["cache_miss"])
+        inp = int(parts["input"])
+        out = int(parts["output"])
         cache_str = ""
-        if hit or miss_cur:
+        if parts["has_cache"]:
             hit_rate = hit / max(hit + miss_cur, 1)
             cache_str = f"  cache: hit={hit:,} miss={miss_cur:,} ({hit_rate:.0%})"
         lines.append(f"  │  Current: in={inp:,}  out={out:,}  ${current_cost:.4f}        │")

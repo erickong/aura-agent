@@ -215,8 +215,8 @@ def review_cycle(force: bool = False) -> dict:
     # Log to long-term memory
     memory_mgr.append_memory(
         "decision",
-        f"反思审查完成 ({timestamp})\n"
-        f"关键建议: {'; '.join(recommendations[:3]) if recommendations else '无特别建议'}"
+        f"Reflection review completed ({timestamp})\n"
+        f"Key recommendations: {'; '.join(recommendations[:3]) if recommendations else 'No specific recommendations'}"
     )
 
     print(f"  [Review] Saved to {review_path}")
@@ -372,7 +372,7 @@ def _extract_recommendations(text: str) -> list[str]:
     for line in text.split("\n"):
         line = line.strip()
         if (
-            ("recommend" in line.lower() or "建议" in line or "改进" in line)
+            ("recommend" in line.lower() or "suggest" in line.lower() or "improve" in line.lower())
             and ("##" in line or "###" in line)
         ):
             in_rec_section = True

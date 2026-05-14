@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import STATE_DIR, MAX_CONCURRENT_TASKS
+from .config import STATE_DIR
 
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 STATE_BAK_PATH = os.path.join(STATE_DIR, "state.json.bak")
@@ -802,7 +802,9 @@ def count_active_tasks() -> int:
 
 
 def can_spawn_task() -> bool:
-    """Check if we can spawn another task (max 2 concurrent)."""
+    """Check if we can spawn another task under the configured concurrency."""
+    from .config import MAX_CONCURRENT_TASKS
+
     return count_active_tasks() < MAX_CONCURRENT_TASKS
 
 

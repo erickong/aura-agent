@@ -136,7 +136,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "spawn_task",
-        "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. Maximum 2 concurrent workers. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
+        "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1190,9 +1190,17 @@ def get_active_tool_definitions() -> list[dict]:
     Tools whose required configuration is not set are excluded.
     Currently: web_search is hidden when AURA_SEARCH_API_KEY is empty.
     """
-    from .config import AURA_SEARCH_API_KEY
+    from .config import AURA_SEARCH_API_KEY, MAX_CONCURRENT_TASKS
 
-    active = list(TOOL_DEFINITIONS)
+    active = [dict(t) for t in TOOL_DEFINITIONS]
+    for tool in active:
+        if tool.get("name") == "spawn_task":
+            tool["description"] = (
+                f"Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. "
+                f"Maximum {MAX_CONCURRENT_TASKS} concurrent workers. Only spawn tasks at "
+                "ROOT -> category -> task level or deeper; top-level ROOT children are "
+                "planning categories, not executable tasks."
+            )
     if not AURA_SEARCH_API_KEY:
         active = [t for t in active if t["name"] != "web_search"]
     return active
