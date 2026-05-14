@@ -1262,7 +1262,8 @@ def _parse_started_at(value) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.astimezone().replace(tzinfo=None)
     except ValueError:
         return None
 
