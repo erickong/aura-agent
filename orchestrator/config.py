@@ -152,7 +152,7 @@ if not AURA_API_KEY:
     )
 
 AURA_API_BASE_URL = _get("AURA_API_BASE_URL", "https://api.deepseek.com/anthropic")
-AURA_API_MODEL = _get("AURA_API_MODEL", "deepseek-v4-pro[1m]")
+AURA_API_MODEL = _get("AURA_API_MODEL", "deepseek-v4-pro")
 AURA_API_MAX_TOKENS = _get_int("AURA_API_MAX_TOKENS", "4096")
 AURA_API_PROVIDER = _get("AURA_API_PROVIDER", "")
 

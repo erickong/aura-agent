@@ -203,7 +203,7 @@ Important environment variables:
 |---|---|---|
 | `AURA_API_KEY` | required | API key for the Layer 1 orchestrator model |
 | `AURA_API_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible API endpoint |
-| `AURA_API_MODEL` | `deepseek-v4-pro[1m]` | Layer 1 model |
+| `AURA_API_MODEL` | `deepseek-v4-pro` | Layer 1 model |
 | `AURA_API_PROVIDER` | (auto-detected) | Provider type: deepseek / anthropic / openai |
 | `AURA_LAYER2_BACKEND` | `claude` | `claude` or `ds_code` |
 | `AURA_CYCLE_INTERVAL` | `300` | Wake interval in seconds |

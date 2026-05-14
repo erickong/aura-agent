@@ -37,7 +37,7 @@ def cmd_wake(args, config_ns):
 
 _KNOWN_BASE_URLS = [
     ("DeepSeek (Anthropic-compatible)", "https://api.deepseek.com/anthropic",
-     "deepseek-v4-pro[1m]", "recommended"),
+     "deepseek-v4-pro", "recommended"),
     ("Anthropic (Official)", "https://api.anthropic.com",
      "claude-sonnet-4-6-20250514", ""),
     ("Custom BaseUrl", "", "", ""),
@@ -192,7 +192,7 @@ def cmd_setup(args, config_ns):
     print()
 
     # ── Model ────────────────────────────────────────────────────────
-    current_model = existing_config.get("AURA_API_MODEL", default_model or "deepseek-v4-pro[1m]")
+    current_model = existing_config.get("AURA_API_MODEL", default_model or "deepseek-v4-pro")
     val = input(f"  Model [{current_model}]: ").strip()
     config["AURA_API_MODEL"] = val or current_model
     print()
@@ -273,7 +273,7 @@ def cmd_setup(args, config_ns):
     # ── Connectivity test ────────────────────────────────────────────
     api_key = config.get("AURA_API_KEY", "")
     api_url = config.get("AURA_API_BASE_URL", "")
-    model = config.get("AURA_API_MODEL", "deepseek-v4-pro[1m]")
+    model = config.get("AURA_API_MODEL", "deepseek-v4-pro")
     if api_key and api_url:
         print()
         print("  Testing API connectivity...")
