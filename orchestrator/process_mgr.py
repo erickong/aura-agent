@@ -916,6 +916,7 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
         "--max-turns", str(DEFAULT_MAX_TURNS),
         "--output-format", "stream-json",
         "--verbose",
+        "--permission-mode", "bypassPermissions",
     ]
 
     cmd = _wrap_windows_script_cmd(claude_bin, claude_args)
