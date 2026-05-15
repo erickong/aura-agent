@@ -11,8 +11,10 @@ import signal
 import math
 import re
 import shutil
+import shlex
 import threading
 import subprocess
+import posixpath
 from datetime import datetime
 from typing import Optional
 
@@ -35,12 +37,27 @@ from .config import (
     WORKER_CUDA_VISIBLE_DEVICES,
     AURA_LAYER2_BACKEND,
     AURA_CLAUDE_BIN,
+    AURA_WORKERS_IN_DOCKER,
+    AURA_DOCKER_BIN,
+    AURA_DOCKER_GPUS,
+    AURA_DOCKER_EXTRA_ARGS,
+    AURA_DOCKER_CLAUDE_API_KEY,
+    AURA_DOCKER_CLAUDE_BASE_URL,
+    AURA_DOCKER_CLAUDE_MODEL,
+    AURA_DOCKER_CLAUDE_SMALL_MODEL,
+    AURA_DOCKER_CLAUDE_SUBAGENT_MODEL,
+    AURA_API_MODEL,
     AURA_API_KEY,
     AURA_DEEPSEEK_API_KEY,
     AURA_DSCODE_MAX_TURNS,
     AURA_DSCODE_MODEL,
     AURA_DSCODE_BASE_URL,
+    AURA_OPENCODE_BIN,
+    AURA_OPENCODE_MODEL,
+    AURA_OPENCODE_MAX_TURNS,
+    STATE_DIR,
     WAKEUP_FILE,
+    PROJECT_ROOT,
     get_workspace_dir,
 )
 
@@ -50,9 +67,41 @@ _process_lock = threading.RLock()
 _resource_monitor_thread: threading.Thread | None = None
 _resource_monitor_stop = threading.Event()
 
+
+_DOCKER_IMAGE = "ghcr.io/erickong/aura-claude-cuda:latest"
+_DOCKER_WORKDIR = "/workspace"
+
 _BYTES_PER_GB = 1024 ** 3
 _PROCESS_START_TOLERANCE_SECONDS = 30
 _REGISTERED_SUBPROCESS_LOG_STALE_SECONDS = 300
+
+
+class DockerImageBuildError(RuntimeError):
+    """Fatal Docker image build failure; Aura cannot run Docker workers."""
+
+
+def _append_error_log(source: str, message: str, task_id: str | None = None) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "error.log")
+        stamp = datetime.now().isoformat(timespec="seconds")
+        task_part = f" task={task_id}" if task_id else ""
+        text = message.rstrip()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] [{source}]{task_part} {text}\n")
+    except Exception:
+        pass
+
+
+def _tail_file(path: str, max_chars: int = 4000) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    if len(data) <= max_chars:
+        return data.strip()
+    return data[-max_chars:].strip()
 
 
 def _gb_to_mb(value: float) -> float:
@@ -762,6 +811,8 @@ def _write_process_record(entry: dict) -> None:
         "killed_at": killed_at,
         "resource_limits": entry.get("resource_limits", _resource_limits()),
         "resource_violation": entry.get("resource_violation"),
+        "docker_container": entry.get("docker_container") or existing.get("docker_container"),
+        "docker_workdir": entry.get("docker_workdir") or existing.get("docker_workdir"),
     }
     with open(record_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
@@ -828,6 +879,8 @@ def _load_process_records() -> None:
                 "killed_at": record.get("killed_at"),
                 "resource_limits": record.get("resource_limits") or _resource_limits(),
                 "resource_violation": record.get("resource_violation"),
+                "docker_container": record.get("docker_container"),
+                "docker_workdir": record.get("docker_workdir"),
             }
         except Exception:
             continue
@@ -871,14 +924,232 @@ def _wrap_windows_script_cmd(exe: str, args: list[str]) -> list[str]:
     return [exe, *args]
 
 
+def _docker_name_for_task(task_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip(".-") or "task"
+    stamp = f"{int(time.time())}-{os.getpid()}"
+    return f"aura-worker-{cleaned}-{stamp}"[:120]
+
+
+def _container_path_for_project(host_path: str) -> str | None:
+    root = os.path.abspath(PROJECT_ROOT)
+    path = os.path.abspath(host_path)
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return None
+    if rel == ".":
+        return _DOCKER_WORKDIR
+    if rel.startswith("..") or os.path.isabs(rel):
+        return None
+    parts = [p for p in rel.split(os.sep) if p and p != "."]
+    return posixpath.join(_DOCKER_WORKDIR, *parts)
+
+
+_docker_host_info: dict[str, object] | None = None
+
+
+def _docker_host_info_get(docker_bin: str) -> dict[str, object]:
+    global _docker_host_info
+    if _docker_host_info is not None:
+        return _docker_host_info
+    _docker_host_info = {}
+    try:
+        proc = subprocess.run(
+            [docker_bin, "info", "--format", "{{json .}}"],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            _docker_host_info = json.loads(proc.stdout)
+    except Exception:
+        pass
+    return _docker_host_info
+
+
+def _docker_resource_args(docker_bin: str) -> list[str]:
+    args: list[str] = []
+
+    if WORKER_MAX_CPU_PERCENT > 0:
+        info = _docker_host_info_get(docker_bin)
+        docker_cpus = info.get("NCPU")
+        if isinstance(docker_cpus, (int, float)) and docker_cpus > 0:
+            cpus = docker_cpus * WORKER_MAX_CPU_PERCENT / 100.0
+            cpus = max(0.01, min(cpus, docker_cpus))
+            args.extend(["--cpus", f"{cpus:.2f}".rstrip("0").rstrip(".")])
+
+    if WORKER_MAX_SYSTEM_MEMORY_PERCENT > 0:
+        info = _docker_host_info_get(docker_bin)
+        docker_mem = info.get("MemTotal")
+        if isinstance(docker_mem, (int, float)) and docker_mem > 0:
+            memory_bytes = docker_mem * WORKER_MAX_SYSTEM_MEMORY_PERCENT / 100.0
+            memory_gb = round(memory_bytes / (1024 ** 3), 2)
+            if memory_gb > 0:
+                args.extend(["--memory", f"{memory_gb:.2f}g"])
+
+    if AURA_DOCKER_GPUS:
+        args.extend(["--gpus", AURA_DOCKER_GPUS])
+
+    return args
+
+
+def _docker_extra_args() -> list[str]:
+    if not AURA_DOCKER_EXTRA_ARGS:
+        return []
+    return shlex.split(AURA_DOCKER_EXTRA_ARGS, posix=(os.name != "nt"))
+
+
+def _docker_image_exists(docker_bin: str, image: str) -> bool:
+    proc = subprocess.run(
+        [docker_bin, "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=30,
+    )
+    return proc.returncode == 0
+
+
+def _ensure_docker_image(docker_bin: str, image: str) -> str:
+    if _docker_image_exists(docker_bin, image):
+        return f"Docker image ready: {image}"
+
+    print(f"  [DOCKER] Image {image} not found locally. Pulling from registry...")
+    _append_error_log("docker-pull", f"Image {image} not local; attempting pull")
+    pull_proc = subprocess.run(
+        [docker_bin, "pull", "--platform", "linux/amd64", image],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=60 * 30,
+    )
+    if pull_proc.returncode != 0:
+        details = (pull_proc.stderr or pull_proc.stdout or "").strip()
+        if len(details) > 4000:
+            details = details[-4000:]
+        raise DockerImageBuildError(
+            f"Docker image {image!r} not found locally and pull failed. "
+            f"Is the image pushed to the registry?\n{details}"
+        )
+
+    if not _docker_image_exists(docker_bin, image):
+        raise DockerImageBuildError(
+            f"Docker pull for {image!r} reported success but the image is still not found."
+        )
+
+    _append_error_log("docker-pull", f"OK image={image}")
+    return f"Docker image pulled: {image}"
+
+
+def _docker_claude_env(base_env: dict | None = None) -> dict:
+    env = _worker_env(base_env)
+    if AURA_DOCKER_CLAUDE_API_KEY:
+        env["ANTHROPIC_API_KEY"] = AURA_DOCKER_CLAUDE_API_KEY
+        env["ANTHROPIC_AUTH_TOKEN"] = AURA_DOCKER_CLAUDE_API_KEY
+    if AURA_DOCKER_CLAUDE_BASE_URL:
+        env["ANTHROPIC_BASE_URL"] = AURA_DOCKER_CLAUDE_BASE_URL
+    model = AURA_DOCKER_CLAUDE_MODEL or AURA_API_MODEL
+    small_model = AURA_DOCKER_CLAUDE_SMALL_MODEL or model
+    subagent_model = AURA_DOCKER_CLAUDE_SUBAGENT_MODEL or model
+    env["ANTHROPIC_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = small_model
+    env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
+    env["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
+    return env
+
+
+def _docker_env_keys(env: dict) -> list[str]:
+    keys = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "CUDA_VISIBLE_DEVICES",
+        "AURA_WORKER_RESOURCE_GUARD",
+        "AURA_WORKER_MAX_CPU_PERCENT",
+        "AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT",
+        "AURA_WORKER_MAX_GPU_UTIL_PERCENT",
+        "AURA_WORKER_MAX_GPU_MEMORY_PERCENT",
+        "AURA_WORKER_MAX_SYSTEM_MEMORY_GB",
+        "AURA_WORKER_MIN_SYSTEM_MEMORY_FREE_GB",
+        "AURA_WORKER_MAX_GPU_MEMORY_GB",
+        "AURA_WORKER_MIN_GPU_MEMORY_FREE_GB",
+        "AURA_WORKER_FORBID_OFFLOAD",
+        "TF_FORCE_GPU_ALLOW_GROWTH",
+        "XLA_PYTHON_CLIENT_PREALLOCATE",
+    ]
+    return [key for key in keys if env.get(key)]
+
+
+def _build_docker_claude_command(task_id: str, task_dir: str) -> tuple[list[str], dict, str, str, str]:
+    if not _DOCKER_IMAGE:
+        raise RuntimeError("_DOCKER_IMAGE is required when AURA_WORKERS_IN_DOCKER=1")
+
+    docker_bin = _resolve_executable("docker", AURA_DOCKER_BIN)
+    if not docker_bin:
+        raise RuntimeError("Docker executable not found. Install Docker or set AURA_DOCKER_BIN.")
+    image_note = _ensure_docker_image(docker_bin, _DOCKER_IMAGE)
+
+    container_task_dir = _container_path_for_project(task_dir)
+    if not container_task_dir:
+        raise RuntimeError(
+            "Docker worker mode requires the task directory to be under the Aura runtime project root. "
+            f"task_dir={task_dir!r}, project_root={PROJECT_ROOT!r}"
+        )
+
+    env = _docker_claude_env()
+    container_name = _docker_name_for_task(task_id)
+    cmd = [
+        docker_bin,
+        "run",
+        "--rm",
+        "--platform", "linux/amd64",
+        "--name", container_name,
+        "--user", "1000:1000",
+        *_docker_resource_args(docker_bin),
+        *_docker_extra_args(),
+        "-v", f"{os.path.abspath(PROJECT_ROOT)}:{_DOCKER_WORKDIR}",
+        "-w", container_task_dir,
+    ]
+    for key in _docker_env_keys(env):
+        cmd.extend(["-e", key])
+    cmd.extend([
+        _DOCKER_IMAGE,
+        "claude",
+        "-p",
+        "@task.md",
+        "--model", env["ANTHROPIC_MODEL"],
+        "--max-turns", str(DEFAULT_MAX_TURNS),
+        "--output-format", "stream-json",
+        "--verbose",
+        "--permission-mode", "bypassPermissions",
+    ])
+    return cmd, env, container_name, container_task_dir, image_note
+
+
 def spawn(task_id: str, task_dir: str, task_md_path: str, budget_minutes: int) -> str:
     """Spawn a Layer 2 worker process for a task.
 
-    Dispatches to claude or ds_code backend based on
+    Dispatches to claude, ds_code, or opencode backend based on
     AURA_LAYER2_BACKEND config (default: claude).
     """
+    if AURA_WORKERS_IN_DOCKER and AURA_LAYER2_BACKEND != "claude":
+        return (
+            "ERROR: AURA_WORKERS_IN_DOCKER=1 currently runs Claude Code inside Docker. "
+            f"Set AURA_LAYER2_BACKEND=claude, not {AURA_LAYER2_BACKEND!r}."
+        )
+
     if AURA_LAYER2_BACKEND == "ds_code":
         return _spawn_dscode(task_id, task_dir, task_md_path, budget_minutes)
+    elif AURA_LAYER2_BACKEND == "opencode":
+        return _spawn_opencode(task_id, task_dir, task_md_path, budget_minutes)
     else:
         return _spawn_claude(task_id, task_dir, task_md_path, budget_minutes)
 
@@ -900,6 +1171,9 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
     ok, preflight = _resource_preflight()
     if not ok:
         return f"ERROR: Resource preflight failed for task {task_id}: {preflight}"
+
+    if AURA_WORKERS_IN_DOCKER:
+        return _spawn_claude_docker(task_id, task_dir, task_md_path, budget_minutes, preflight)
 
     # Resolve claude executable cross-platform
     claude_bin = _resolve_executable("claude", AURA_CLAUDE_BIN)
@@ -970,6 +1244,11 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
                 f"Budget: {budget_minutes}min.{affinity_note} {preflight}")
 
     except FileNotFoundError as e:
+        _append_error_log(
+            "claude-spawn",
+            f"Claude Code CLI not found or failed to start: {e}; claude_bin={claude_bin!r}; cmd={cmd!r}",
+            task_id,
+        )
         return (
             "ERROR: Failed to start Claude Code CLI.\n"
             f"Resolved claude_bin: {claude_bin!r}\n"
@@ -979,11 +1258,112 @@ def _spawn_claude(task_id: str, task_dir: str, task_md_path: str, budget_minutes
             f"Details: {e}"
         )
     except Exception as e:
+        stderr_tail = _tail_file(error_path)
+        detail = (
+            f"Failed to spawn Claude Code worker: {type(e).__name__}: {e}\n"
+            f"claude_bin={claude_bin!r}\ncmd={cmd!r}\ncwd={task_dir}"
+        )
+        if stderr_tail:
+            detail += f"\nstderr tail:\n{stderr_tail}"
+        _append_error_log("claude-spawn", detail, task_id)
         return (
             "ERROR: Failed to spawn Claude Code worker.\n"
             f"Resolved claude_bin: {claude_bin!r}\n"
             f"Command: {cmd!r}\n"
             f"cwd: {task_dir}\n"
+            f"Details: {type(e).__name__}: {e}"
+        )
+
+
+def _spawn_claude_docker(
+    task_id: str,
+    task_dir: str,
+    task_md_path: str,
+    budget_minutes: int,
+    preflight: str,
+) -> str:
+    """Spawn Claude Code inside a Docker container for a task."""
+    try:
+        cmd, env, container_name, container_task_dir, image_note = _build_docker_claude_command(task_id, task_dir)
+    except DockerImageBuildError:
+        raise
+    except RuntimeError as e:
+        _append_error_log("docker-spawn", str(e), task_id)
+        return f"ERROR spawning Docker worker for task {task_id}: {e}"
+
+    output_path = os.path.join(task_dir, "output.jsonl")
+    error_path = os.path.join(task_dir, "error.log")
+    _append_error_log(
+        "docker-run",
+        f"Starting container={container_name} workdir={container_task_dir} cmd={cmd!r}",
+        task_id,
+    )
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as out_f, \
+             open(error_path, "w", encoding="utf-8") as err_f:
+
+            if sys.platform == "win32":
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=PROJECT_ROOT,
+                    stdout=out_f,
+                    stderr=err_f,
+                    env=env,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=PROJECT_ROOT,
+                    stdout=out_f,
+                    stderr=err_f,
+                    env=env,
+                    preexec_fn=os.setsid,
+                )
+
+        cpu_affinity = _apply_cpu_affinity(proc.pid)
+        _active_processes[task_id] = {
+            "pid": proc.pid,
+            "task_id": task_id,
+            "task_dir": task_dir,
+            "started_at": datetime.now(),
+            "budget_minutes": budget_minutes,
+            "process": proc,
+            "output_path": output_path,
+            "resource_limits": _resource_limits(),
+            "cpu_affinity": cpu_affinity,
+            "docker_container": container_name,
+            "docker_workdir": container_task_dir,
+        }
+        _write_process_record(_active_processes[task_id])
+        _ensure_resource_monitor()
+
+        affinity_note = f" CPU affinity: {cpu_affinity}." if cpu_affinity else ""
+        return (f"OK: Task {task_id} started (PID: {proc.pid}, backend: claude/docker, "
+                f"container: {container_name}). Output: {task_dir}/output.jsonl "
+                f"Budget: {budget_minutes}min.{affinity_note} {image_note}. {preflight}")
+
+    except FileNotFoundError:
+        _append_error_log("docker-run", "docker command not found", task_id)
+        return (
+            "ERROR spawning Docker worker: docker command not found. "
+            "Install Docker or set AURA_DOCKER_BIN."
+        )
+    except Exception as e:
+        stderr_tail = _tail_file(error_path)
+        detail = (
+            f"Failed to spawn Docker Claude worker: {type(e).__name__}: {e}\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {PROJECT_ROOT}"
+        )
+        if stderr_tail:
+            detail += f"\nstderr tail:\n{stderr_tail}"
+        _append_error_log("docker-run", detail, task_id)
+        return (
+            "ERROR: Failed to spawn Docker Claude worker.\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {PROJECT_ROOT}\n"
             f"Details: {type(e).__name__}: {e}"
         )
 
@@ -1074,10 +1454,130 @@ def _spawn_dscode(task_id: str, task_dir: str, task_md_path: str, budget_minutes
                 f"Budget: {budget_minutes}min.{affinity_note} {preflight}")
 
     except FileNotFoundError:
+        _append_error_log("dscode-spawn", "ds-code command not found", task_id)
         return ("ERROR spawning task {task_id}: ds-code command not found. "
                 "Install with: cd ds_code && pip install -e .")
     except Exception as e:
+        stderr_tail = _tail_file(error_path)
+        detail = f"Failed to spawn ds-code worker: {type(e).__name__}: {e}\ncmd={cmd!r}\ncwd={task_dir}"
+        if stderr_tail:
+            detail += f"\nstderr tail:\n{stderr_tail}"
+        _append_error_log("dscode-spawn", detail, task_id)
         return f"ERROR spawning task {task_id}: {e}"
+
+
+def _spawn_opencode(task_id: str, task_dir: str, task_md_path: str, budget_minutes: int) -> str:
+    """Spawn an OpenCode CLI process for a task.
+
+    Uses 'opencode run' non-interactive mode with the task.md file attached.
+    """
+    if task_id in _active_processes:
+        existing = _active_processes[task_id]
+        if _entry_process_is_alive(existing):
+            return f"ERROR: Task {task_id} is already running (PID: {existing['pid']})"
+
+    ok, preflight = _resource_preflight()
+    if not ok:
+        return f"ERROR: Resource preflight failed for task {task_id}: {preflight}"
+
+    opencode_bin = _resolve_executable("opencode", AURA_OPENCODE_BIN)
+    if not opencode_bin:
+        return (
+            "ERROR: OpenCode CLI not found in PATH. "
+            "Install it from https://opencode.ai, "
+            "or set AURA_OPENCODE_BIN to the executable path."
+        )
+
+    opencode_args = [
+        "run",
+        "Complete the task",
+        "--file", "task.md",
+        "--dangerously-skip-permissions",
+        "--format", "json",
+    ]
+
+    if AURA_OPENCODE_MODEL:
+        opencode_args.extend(["--model", AURA_OPENCODE_MODEL])
+
+    cmd = _wrap_windows_script_cmd(opencode_bin, opencode_args)
+
+    output_path = os.path.join(task_dir, "output.jsonl")
+    error_path = os.path.join(task_dir, "error.log")
+    env = _worker_env()
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as out_f, \
+             open(error_path, "w", encoding="utf-8") as err_f:
+
+            if sys.platform == "win32":
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=task_dir,
+                    stdout=out_f,
+                    stderr=err_f,
+                    env=env,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=task_dir,
+                    stdout=out_f,
+                    stderr=err_f,
+                    env=env,
+                    preexec_fn=os.setsid,
+                )
+
+        cpu_affinity = _apply_cpu_affinity(proc.pid)
+        _active_processes[task_id] = {
+            "pid": proc.pid,
+            "task_id": task_id,
+            "task_dir": task_dir,
+            "started_at": datetime.now(),
+            "budget_minutes": budget_minutes,
+            "process": proc,
+            "output_path": output_path,
+            "resource_limits": _resource_limits(),
+            "cpu_affinity": cpu_affinity,
+        }
+        _write_process_record(_active_processes[task_id])
+        _ensure_resource_monitor()
+
+        affinity_note = f" CPU affinity: {cpu_affinity}." if cpu_affinity else ""
+        return (f"OK: Task {task_id} started (PID: {proc.pid}, backend: opencode). "
+                f"Output: {task_dir}/output.jsonl "
+                f"Budget: {budget_minutes}min.{affinity_note} {preflight}")
+
+    except FileNotFoundError as e:
+        _append_error_log(
+            "opencode-spawn",
+            f"OpenCode CLI not found or failed to start: {e}; opencode_bin={opencode_bin!r}; cmd={cmd!r}",
+            task_id,
+        )
+        return (
+            "ERROR: Failed to start OpenCode CLI.\n"
+            f"Resolved opencode_bin: {opencode_bin!r}\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {task_dir}\n"
+            f"PATH: {os.environ.get('PATH', '')}\n"
+            f"Details: {e}"
+        )
+    except Exception as e:
+        stderr_tail = _tail_file(error_path)
+        detail = (
+            f"Failed to spawn OpenCode worker: {type(e).__name__}: {e}\n"
+            f"opencode_bin={opencode_bin!r}\ncmd={cmd!r}\ncwd={task_dir}"
+        )
+        if stderr_tail:
+            detail += f"\nstderr tail:\n{stderr_tail}"
+        _append_error_log("opencode-spawn", detail, task_id)
+        return (
+            "ERROR: Failed to spawn OpenCode worker.\n"
+            f"Resolved opencode_bin: {opencode_bin!r}\n"
+            f"Command: {cmd!r}\n"
+            f"cwd: {task_dir}\n"
+            f"Details: {type(e).__name__}: {e}"
+        )
 
 
 def kill(task_id: str) -> str:
@@ -1098,6 +1598,23 @@ def kill(task_id: str) -> str:
 
         proc = psutil.Process(pid)
         children = proc.children(recursive=True)
+        docker_container = entry.get("docker_container")
+
+        if docker_container:
+            docker_bin = _resolve_executable("docker", AURA_DOCKER_BIN) or AURA_DOCKER_BIN or "docker"
+            stop_proc = subprocess.run(
+                [docker_bin, "rm", "-f", docker_container],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=20,
+            )
+            if stop_proc.returncode != 0:
+                _append_error_log(
+                    "docker-kill",
+                    f"docker rm -f failed for {docker_container}: {stop_proc.stderr or stop_proc.stdout}",
+                    task_id,
+                )
 
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -1137,8 +1654,10 @@ def kill(task_id: str) -> str:
         return f"WARN: Task {task_id} (PID: {pid}) was already dead"
     except subprocess.TimeoutExpired:
         _active_processes[task_id]["running"] = _entry_process_is_alive(_active_processes[task_id])
+        _append_error_log("kill", f"taskkill timed out for PID {pid}", task_id)
         return f"ERROR killing task {task_id}: taskkill timed out for PID {pid}"
     except Exception as e:
+        _append_error_log("kill", f"{type(e).__name__}: {e}", task_id)
         return f"ERROR killing task {task_id}: {e}"
 
 

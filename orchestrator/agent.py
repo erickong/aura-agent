@@ -45,6 +45,7 @@ from .config import (
     TOOL_CALL_BUDGET_PLANNING,
 )
 from .tools import TOOL_DEFINITIONS, execute_tool, get_active_tool_definitions
+from .process_mgr import DockerImageBuildError
 from . import state as state_mgr
 from . import memory as memory_mgr
 from . import progress as progress_mgr
@@ -112,7 +113,7 @@ You are NOT a chatbot. You are a goal-completion engine. Your only purpose is to
 
 ## Layer 2 Backend
 Your Layer 2 workers run on: {layer2_backend}
-This determines how sub-tasks are executed (Claude Code CLI or ds-code).
+This determines how sub-tasks are executed (Claude Code CLI, ds-code, or OpenCode).
 
 ## Your Operating Philosophy
 
@@ -813,6 +814,8 @@ Now assess the situation and decide what to do.
         context += "\n- Workers run via Claude Code CLI (claude -p @task.md)"
     elif AURA_LAYER2_BACKEND == "ds_code":
         context += "\n- Workers run via ds-code CLI (ds-code run)"
+    elif AURA_LAYER2_BACKEND == "opencode":
+        context += "\n- Workers run via OpenCode CLI (opencode run)"
 
     return context
 
@@ -1192,6 +1195,8 @@ def run_cycle(wake_change: dict | None = None) -> dict:
         base_url=AURA_API_BASE_URL,
         api_key=AURA_API_KEY,
         auth_token=AURA_API_KEY,
+        timeout=API_TIMEOUT_SECONDS,
+        max_retries=0,
     )
 
     messages = [{"role": "user", "content": context_msg}]
@@ -1357,6 +1362,8 @@ def run_cycle(wake_change: dict | None = None) -> dict:
                 "content": tool_results,
             })
 
+    except DockerImageBuildError:
+        raise
     except Exception as e:
         print(f"[ERROR] Cycle API call failed: {e}")
         import traceback

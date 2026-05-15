@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aura-agent"
-version = "0.1.2"
+version = "0.1.3"
 description = "Goal-driven agent for long-running tasks, intelligent task decomposition, and autonomous execution"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,9 +16,10 @@ dependencies = [
 
 [project.scripts]
 aura = "orchestrator.main:main"
+aura-install-runner = "orchestrator.runner:main"
 
 [tool.setuptools.packages.find]
 include = ["orchestrator*"]
 
 [tool.setuptools.package-data]
-orchestrator = ["templates/*.md"]
+orchestrator = ["templates/*.md", "docker/*"]

@@ -60,6 +60,7 @@ Supported backends:
 
 - `claude`: runs `claude -p @task.md --output-format stream-json`
 - `ds_code`: runs `ds-code run --workspace <task_dir>`
+- `opencode`: runs `opencode run --file task.md --format json`
 
 Each worker receives a generated `task.md` and works inside `.aura/workspace/tasks/<task-id>/`.
 

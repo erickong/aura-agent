@@ -104,6 +104,22 @@ def _parse_env_file(path: str) -> dict[str, str]:
     return config
 
 
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return ""
+
+
+def _mask_secret(value: str, empty_label: str = "(not set)") -> str:
+    if not value:
+        return empty_label
+    if len(value) <= 12:
+        return value[:4] + "..." + value[-2:] if len(value) > 6 else "***"
+    return value[:8] + "..." + value[-4:]
+
+
 def cmd_setup(args, config_ns):
     """R5: Interactive first-time configuration wizard."""
     print("=" * 60)
@@ -132,7 +148,7 @@ def cmd_setup(args, config_ns):
 
     # ── API Key (one key for all providers) ──────────────────────────
     default_key = existing_config.get("AURA_API_KEY", "")
-    masked = default_key[:8] + "***" if len(default_key) > 8 else "(not set)"
+    masked = _mask_secret(default_key)
     print("─ API Key ──────────────────────────────────────────────────")
     val = input(f"  API Key [{masked}]: ").strip()
     config["AURA_API_KEY"] = val or default_key
@@ -140,7 +156,7 @@ def cmd_setup(args, config_ns):
 
     # ── Web Search API Key (optional, enables web_search tool) ─────────
     default_search_key = existing_config.get("AURA_SEARCH_API_KEY", "")
-    search_masked = default_search_key[:8] + "***" if len(default_search_key) > 8 else ("(not set / disabled)" if not default_search_key else "(not set)")
+    search_masked = _mask_secret(default_search_key, "(not set / disabled)")
     print("─ Web Search (Tavily) ────────────────────────────────────────")
     print("  Optional. Get a free API key at https://tavily.com")
     print("  Without this, the web_search tool will not be available.")
@@ -206,15 +222,75 @@ def cmd_setup(args, config_ns):
     config["AURA_CYCLE_INTERVAL"] = val or default_cycle
 
     default_backend = existing_config.get("AURA_LAYER2_BACKEND", "claude")
-    val = input(f"Layer 2 Backend (claude/ds_code) [{default_backend}]: ").strip().lower()
-    if val not in ("claude", "ds_code", ""):
+    val = input(f"Layer 2 Backend (claude/ds_code/opencode) [{default_backend}]: ").strip().lower()
+    if val not in ("claude", "ds_code", "opencode", ""):
         print("[WARN] Invalid backend. Using default: claude")
         val = ""
     config["AURA_LAYER2_BACKEND"] = val or default_backend
 
+    print()
+    print("--- Docker Worker Isolation ---")
+    default_docker = existing_config.get("AURA_WORKERS_IN_DOCKER", "0")
+    val = input(f"Run Layer 2 workers in Docker? (1=yes, 0=no) [{default_docker}]: ").strip()
+    config["AURA_WORKERS_IN_DOCKER"] = val or default_docker
+    docker_enabled = config["AURA_WORKERS_IN_DOCKER"] not in {"0", "false", "False", "no", "off", ""}
+    if docker_enabled:
+        default_docker_bin = existing_config.get("AURA_DOCKER_BIN", _first_env("AURA_DOCKER_BIN") or "docker")
+        val = input(f"Docker command [{default_docker_bin}]: ").strip()
+        config["AURA_DOCKER_BIN"] = val or default_docker_bin
+
+
+        default_gpus = existing_config.get("AURA_DOCKER_GPUS", _first_env("AURA_DOCKER_GPUS", "NVIDIA_VISIBLE_DEVICES"))
+        val = input(f"Docker GPU flag value, e.g. all or device=0 (blank=none) [{default_gpus}]: ").strip()
+        config["AURA_DOCKER_GPUS"] = val or default_gpus
+
+        default_extra = existing_config.get("AURA_DOCKER_EXTRA_ARGS", _first_env("AURA_DOCKER_EXTRA_ARGS"))
+        val = input(f"Extra docker run args (blank=none) [{default_extra}]: ").strip()
+        config["AURA_DOCKER_EXTRA_ARGS"] = val or default_extra
+
+        default_claude_key = (
+            existing_config.get("AURA_DOCKER_CLAUDE_API_KEY")
+            or _first_env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY")
+        )
+        key_masked = _mask_secret(default_claude_key)
+        val = input(f"Claude API key for Docker workers [{key_masked}]: ").strip()
+        config["AURA_DOCKER_CLAUDE_API_KEY"] = val or default_claude_key
+
+        default_claude_url = (
+            existing_config.get("AURA_DOCKER_CLAUDE_BASE_URL")
+            or _first_env("ANTHROPIC_BASE_URL", "CLAUDE_BASE_URL")
+        )
+        val = input(f"Claude base URL for Docker workers (blank=Claude default) [{default_claude_url}]: ").strip()
+        config["AURA_DOCKER_CLAUDE_BASE_URL"] = val or default_claude_url
+
+        default_docker_model = (
+            existing_config.get("AURA_DOCKER_CLAUDE_MODEL")
+            or existing_config.get("AURA_API_MODEL", "deepseek-v4-pro")
+        )
+        val = input(f"Claude model for Docker workers [{default_docker_model}]: ").strip()
+        config["AURA_DOCKER_CLAUDE_MODEL"] = val or default_docker_model
+
+        default_docker_small = (
+            existing_config.get("AURA_DOCKER_CLAUDE_SMALL_MODEL", "")
+        )
+        val = input(f"Claude small/fast model for Docker workers (blank=same as worker model) [{default_docker_small}]: ").strip()
+        config["AURA_DOCKER_CLAUDE_SMALL_MODEL"] = val or default_docker_small
+
+        default_docker_subagent = (
+            existing_config.get("AURA_DOCKER_CLAUDE_SUBAGENT_MODEL", "")
+        )
+        val = input(f"Claude sub-agent model for Docker workers (blank=same as worker model) [{default_docker_subagent}]: ").strip()
+        config["AURA_DOCKER_CLAUDE_SUBAGENT_MODEL"] = val or default_docker_subagent
+
+    # ds-code specific config
     default_dscode_model = existing_config.get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
     val = input(f"ds-code Model [{default_dscode_model}]: ").strip()
     config["AURA_DSCODE_MODEL"] = val or default_dscode_model
+
+    # OpenCode specific config
+    default_opencode_model = existing_config.get("AURA_OPENCODE_MODEL", "deepseek-v4-pro")
+    val = input(f"OpenCode Model [{default_opencode_model}]: ").strip()
+    config["AURA_OPENCODE_MODEL"] = val or default_opencode_model
 
     default_budget = existing_config.get("AURA_TASK_BUDGET", "30")
     val = input(f"Default Task Budget (min) [{default_budget}]: ").strip()

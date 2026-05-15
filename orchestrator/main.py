@@ -35,6 +35,10 @@ CODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.getcwd())
 sys.path.insert(0, CODE_ROOT)
 
+from orchestrator.runner import maybe_reexec_with_runner
+
+maybe_reexec_with_runner()
+
 # ── Early override parsing (before config import) ─────────────────────
 # These will be set on orchestrator.config module before its first import.
 # This is how overrides flow WITHOUT touching os.environ.
@@ -268,6 +272,7 @@ GLOBAL_CONFIG_PATH = _global_config_path
 _new_argv = [sys.argv[0]]
 _skip_next = False
 _workers_override = None
+_cli_overrides: dict[str, str] = {}
 for i, arg in enumerate(sys.argv[1:], 1):
     if _skip_next:
         _skip_next = False
@@ -291,6 +296,31 @@ for i, arg in enumerate(sys.argv[1:], 1):
         continue
     elif arg.startswith("-w="):
         _workers_override = arg.split("=", 1)[1]
+        continue
+    elif arg in ("--override", "-O") and i + 1 < len(sys.argv):
+        _ov = sys.argv[i + 1]
+        _skip_next = True
+        if "=" in _ov:
+            _k, _v = _ov.split("=", 1)
+            _cli_overrides[_k.strip()] = _v.strip()
+        else:
+            print(f"[WARN] --override expects KEY=VALUE, got: {_ov!r}")
+        continue
+    elif arg.startswith("--override="):
+        _ov = arg.split("=", 1)[1]
+        if "=" in _ov:
+            _k, _v = _ov.split("=", 1)
+            _cli_overrides[_k.strip()] = _v.strip()
+        else:
+            print(f"[WARN] --override expects KEY=VALUE, got: {_ov!r}")
+        continue
+    elif arg.startswith("-O="):
+        _ov = arg.split("=", 1)[1]
+        if "=" in _ov:
+            _k, _v = _ov.split("=", 1)
+            _cli_overrides[_k.strip()] = _v.strip()
+        else:
+            print(f"[WARN] -O expects KEY=VALUE, got: {_ov!r}")
         continue
     _new_argv.append(arg)
 sys.argv = _new_argv
@@ -316,12 +346,23 @@ def _apply_workers_override(cfg_mod, value):
 import importlib.util as _importlib_util
 import sys as _sys
 
+def _apply_cli_overrides(cfg_mod, overrides: dict[str, str]):
+    if not overrides:
+        return
+    for k, v in overrides.items():
+        try:
+            setattr(cfg_mod, k, v)
+        except Exception:
+            pass
+
+
 # Skip if already configured (e.g., by test conftest)
 _existing_cfg = _sys.modules.get("orchestrator.config")
 if _existing_cfg is not None and getattr(_existing_cfg, "_config_data", None) is not None:
     # Config already loaded from file — don't replace. Tests or embedded
     # usage pre-configure the module before main.py is imported.
     _apply_workers_override(_existing_cfg, _workers_override)
+    _apply_cli_overrides(_existing_cfg, _cli_overrides)
 else:
     # Determine data_dir BEFORE config module loads (so DATA_DIR_OVERRIDE is final)
     _select_task_data_dir_before_import()
@@ -336,6 +377,10 @@ else:
     if _data_dir_override:
         _cfg_mod.DATA_DIR_OVERRIDE = _data_dir_override
     _cfg_mod.PROJECT_ROOT_OVERRIDE = PROJECT_ROOT
+    if _cli_overrides:
+        _cfg_mod.CLI_OVERRIDES = _cli_overrides
+        for k, v in _cli_overrides.items():
+            print(f"[CONFIG] CLI override: {k}={v}")
 
     _sys.modules["orchestrator.config"] = _cfg_mod
     _cfg_spec.loader.exec_module(_cfg_mod)
@@ -385,6 +430,7 @@ from orchestrator import state as state_mgr
 from orchestrator import memory as memory_mgr
 from orchestrator import progress as progress_mgr
 from orchestrator import process_mgr
+from orchestrator.process_mgr import DockerImageBuildError
 from orchestrator.agent import run_cycle, should_skip_l1_cycle
 from orchestrator.changelog import (
     get_file_change_info,
@@ -416,6 +462,7 @@ def _get_startup_banner() -> str:
     backend_display = {
         "claude": "Claude Code CLI (Anthropic)",
         "ds_code": "ds-code CLI (DeepSeek)",
+        "opencode": "OpenCode CLI",
     }.get(AURA_LAYER2_BACKEND, AURA_LAYER2_BACKEND)
 
     return (
@@ -1294,6 +1341,12 @@ def cmd_start(args):
             _running = False
             _kill_running_workers()
             break
+        except DockerImageBuildError as e:
+            print(f"\n[FATAL] Docker image build failed — Aura cannot run Docker workers.")
+            print(f"  {e}")
+            _kill_running_workers()
+            _running = False
+            break
         except Exception as e:
             print(f"\n[ERROR] Unexpected crash in cycle: {e}")
             _render_progress_safely("unexpected cycle crash")
@@ -1610,6 +1663,9 @@ def main():
     parser.add_argument("--config", "-c", help="Path to .env config file", default=None)
     parser.add_argument("--workers", "-w", type=int, default=None,
                         help="Max concurrent workers (default: 2, or AURA_MAX_CONCURRENT_TASKS env)")
+    parser.add_argument("--override", "-O", action="append", default=None,
+                        help="Override any config value (KEY=VALUE). "
+                             "Can be used multiple times. Example: --override AURA_DOCKER_CLAUDE_MODEL=claude")
     parser.add_argument("--data-dir", default=None,
                         help="Data directory for process files (memory, state, workspace). "
                              "Default: ./.aura/<task-file-name>-<path-hash>/ for task-file commands.")

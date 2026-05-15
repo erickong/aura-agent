@@ -2226,6 +2226,268 @@ class TestResourceGuard:
         assert "AURA_WORKER_MAX_SYSTEM_MEMORY_PERCENT" in env
 
 
+class TestRunnerBootstrap:
+    """Test the aura-runner executable bootstrap."""
+
+    def test_ensure_runner_executable_creates_same_directory_runner(self, tmp_path):
+        from orchestrator.runner import ensure_runner_executable
+
+        exe = tmp_path / ("python.exe" if os.name == "nt" else "python3.11")
+        exe.write_bytes(b"fake-python-binary")
+
+        runner = ensure_runner_executable(exe)
+
+        assert runner.parent == exe.parent
+        assert runner.name == ("aura-runner.exe" if os.name == "nt" else "aura-runner")
+        assert runner.read_bytes() == exe.read_bytes()
+
+    def test_ensure_runner_executable_falls_back_to_copy(self, tmp_path, monkeypatch):
+        from orchestrator import runner as runner_mod
+
+        exe = tmp_path / ("python.exe" if os.name == "nt" else "python")
+        exe.write_bytes(b"copy-fallback-binary")
+
+        def fail_link(_source, _target):
+            raise OSError("hardlink unavailable")
+
+        monkeypatch.setattr(runner_mod.os, "link", fail_link)
+
+        runner = runner_mod.ensure_runner_executable(exe)
+
+        assert runner.exists()
+        assert runner.read_bytes() == exe.read_bytes()
+
+    def test_ensure_runner_executable_force_replaces_old_runner(self, tmp_path):
+        from orchestrator.runner import ensure_runner_executable, runner_path_for
+
+        exe = tmp_path / ("python.exe" if os.name == "nt" else "python")
+        exe.write_bytes(b"new-python-binary")
+        runner = runner_path_for(exe)
+        runner.write_bytes(b"old-runner-binary")
+
+        result = ensure_runner_executable(exe, force=True)
+
+        assert result == runner
+        assert runner.read_bytes() == exe.read_bytes()
+
+    def test_should_reexec_only_for_python_named_executables(self):
+        from orchestrator.runner import should_reexec_with_runner
+
+        assert should_reexec_with_runner("C:/Python/python.exe", {}, "aura.exe") is True
+        assert should_reexec_with_runner("C:/Python/python3", {}, "aura") is True
+        assert should_reexec_with_runner("C:/Python/aura-runner.exe", {}, "aura.exe") is False
+        assert should_reexec_with_runner("C:/Python/python.exe", {"AURA_RUNNER_BOOTSTRAPPED": "1"}, "aura.exe") is False
+        assert should_reexec_with_runner("C:/Python/python.exe", {}, "pytest.exe") is False
+
+    def test_patch_console_launcher_rewrites_embedded_shebang(self, tmp_path):
+        from orchestrator.runner import patch_console_launcher
+
+        launcher = tmp_path / "aura.exe"
+        runner = tmp_path / "aura-runner.exe"
+        launcher.write_bytes(
+            b"launcher-prefix"
+            b"#!C:\\Python\\python.exe\n"
+            b"PK\x03\x04zip-payload"
+        )
+
+        changed = patch_console_launcher(launcher, runner)
+
+        assert changed is True
+        assert f"#!{runner}\n".encode() in launcher.read_bytes()
+
+
+class TestDockerWorkerMode:
+    """Test Docker command construction for worker isolation."""
+
+    def test_docker_mode_refuses_local_non_claude_backend(self, tmp_path, monkeypatch):
+        from orchestrator import process_mgr
+
+        task_dir = tmp_path / "task"
+        task_dir.mkdir()
+        task_md = task_dir / "task.md"
+        task_md.write_text("test", encoding="utf-8")
+
+        monkeypatch.setattr(process_mgr, "AURA_WORKERS_IN_DOCKER", True)
+        monkeypatch.setattr(process_mgr, "AURA_LAYER2_BACKEND", "ds_code")
+
+        result = process_mgr.spawn("A1", str(task_dir), str(task_md), 30)
+
+        assert "AURA_WORKERS_IN_DOCKER=1" in result
+        assert "AURA_LAYER2_BACKEND=claude" in result
+
+    def test_container_path_requires_project_root(self, tmp_path, monkeypatch):
+        from orchestrator import process_mgr
+
+        project = tmp_path / "project"
+        task_dir = project / ".aura" / "workspace" / "tasks" / "A1"
+        task_dir.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        monkeypatch.setattr(process_mgr, "PROJECT_ROOT", str(project))
+        monkeypatch.setattr(process_mgr, "_DOCKER_WORKDIR", "/workspace")
+
+        assert process_mgr._container_path_for_project(str(task_dir)) == "/workspace/.aura/workspace/tasks/A1"
+        assert process_mgr._container_path_for_project(str(outside)) is None
+
+    def test_build_docker_claude_command_mounts_root_and_passes_env(self, tmp_path, monkeypatch):
+        from orchestrator import process_mgr
+
+        project = tmp_path / "project"
+        task_dir = project / ".aura" / "workspace" / "tasks" / "A1"
+        task_dir.mkdir(parents=True)
+
+        monkeypatch.setattr(process_mgr, "PROJECT_ROOT", str(project))
+        monkeypatch.setattr(process_mgr, "AURA_DOCKER_BIN", "docker")
+        monkeypatch.setattr(process_mgr, "_DOCKER_IMAGE", "aura-claude-cuda:test")
+        monkeypatch.setattr(process_mgr, "_DOCKER_WORKDIR", "/workspace")
+        monkeypatch.setattr(process_mgr, "AURA_DOCKER_GPUS", "all")
+        monkeypatch.setattr(process_mgr, "AURA_DOCKER_EXTRA_ARGS", "--network host")
+        monkeypatch.setattr(process_mgr, "AURA_DOCKER_CLAUDE_API_KEY", "sk-test")
+        monkeypatch.setattr(process_mgr, "AURA_DOCKER_CLAUDE_BASE_URL", "https://api.example.test")
+
+        monkeypatch.setattr(process_mgr, "_resolve_executable", lambda name, configured="": configured or name)
+        monkeypatch.setattr(process_mgr, "_ensure_docker_image", lambda docker_bin, image: f"Docker image ready: {image}")
+
+        cmd, env, container_name, container_workdir, image_note = process_mgr._build_docker_claude_command("A1", str(task_dir))
+
+        assert cmd[:5] == ["docker", "run", "--rm", "--platform", "linux/amd64"]
+        assert "--gpus" in cmd and "all" in cmd
+        assert "--network" in cmd and "host" in cmd
+        assert "-v" in cmd and f"{project}:/workspace" in cmd
+        assert "-w" in cmd and container_workdir == "/workspace/.aura/workspace/tasks/A1"
+        assert "aura-claude-cuda:test" in cmd
+        assert cmd[-13:] == [
+            "aura-claude-cuda:test",
+            "claude",
+            "-p",
+            "@task.md",
+            "--model", env["ANTHROPIC_MODEL"],
+            "--max-turns", str(process_mgr.DEFAULT_MAX_TURNS),
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "bypassPermissions",
+        ]
+        assert env["ANTHROPIC_API_KEY"] == "sk-test"
+        assert env["ANTHROPIC_BASE_URL"] == "https://api.example.test"
+        assert env["ANTHROPIC_MODEL"] == "test-model"
+        assert container_name.startswith("aura-worker-A1-")
+        assert image_note == "Docker image ready: aura-claude-cuda:test"
+
+    def test_ensure_docker_image_pulls_when_missing(self, monkeypatch):
+        from orchestrator import process_mgr
+
+        inspect_calls = []
+        pull_calls = []
+
+        def fake_inspect(docker_bin, image):
+            inspect_calls.append(image)
+            return len(inspect_calls) > 1  # False on first call, True after pull
+
+        class Proc:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            pull_calls.append(cmd)
+            return Proc()
+
+        monkeypatch.setattr(process_mgr, "_docker_image_exists", fake_inspect)
+        monkeypatch.setattr(process_mgr.subprocess, "run", fake_run)
+
+        result = process_mgr._ensure_docker_image("docker", "aura-test:latest")
+
+        assert result == "Docker image pulled: aura-test:latest"
+        assert pull_calls == [["docker", "pull", "aura-test:latest"]]
+
+    def test_ensure_docker_image_errors_when_pull_fails(self, monkeypatch):
+        from orchestrator import process_mgr
+
+        class Proc:
+            returncode = 1
+            stdout = ""
+            stderr = "not found"
+
+        monkeypatch.setattr(process_mgr, "_docker_image_exists", lambda docker_bin, image: False)
+        monkeypatch.setattr(process_mgr.subprocess, "run", lambda cmd, **kwargs: Proc())
+
+        with pytest.raises(RuntimeError, match="not found"):
+            process_mgr._ensure_docker_image("docker", "missing:latest")
+
+    def test_error_log_writes_under_state_dir(self, tmp_path, monkeypatch):
+        from orchestrator import process_mgr
+
+        state_dir = tmp_path / "state"
+        monkeypatch.setattr(process_mgr, "STATE_DIR", str(state_dir))
+
+        process_mgr._append_error_log("docker-run", "boom", "A1")
+
+        log = state_dir / "error.log"
+        text = log.read_text(encoding="utf-8")
+        assert "[docker-run]" in text
+        assert "task=A1" in text
+        assert "boom" in text
+
+    def test_worker_location_prompt_differs_for_docker(self, tmp_path, monkeypatch):
+        from orchestrator import tools
+
+        project = tmp_path / "project"
+        task_id = "runtime-task-123"
+        task_dir = project / ".aura" / "workspace" / "tasks" / task_id
+        task_dir.mkdir(parents=True)
+
+        monkeypatch.setattr(tools, "PROJECT_ROOT", str(project))
+        monkeypatch.setattr(tools, "AURA_WORKERS_IN_DOCKER", True)
+        monkeypatch.setattr(tools, "_DOCKER_WORKDIR", "/workspace")
+
+        docker_prompt = tools._worker_location_prompt(str(task_dir))
+
+        assert docker_prompt.count("\n") == 1
+        expected_task_dir = f"/workspace/.aura/workspace/tasks/{task_id}"
+        assert f"Current working directory: {expected_task_dir}" in docker_prompt
+        assert "This current directory is the task output directory. Put all outputs here." in docker_prompt
+        assert "Project root is /workspace" in docker_prompt
+
+        monkeypatch.setattr(tools, "AURA_WORKERS_IN_DOCKER", False)
+
+        local_prompt = tools._worker_location_prompt(str(task_dir))
+
+        assert local_prompt.count("\n") == 1
+        assert f"Current working directory: {task_dir}" in local_prompt
+        assert local_prompt.endswith("This current directory is the task output directory. Put all outputs here.")
+        assert "Project root is" not in local_prompt
+
+    def test_execution_environment_path_rewrites_only_in_docker(self, tmp_path, monkeypatch):
+        from orchestrator import tools
+
+        project = tmp_path / "project"
+        monkeypatch.setattr(tools, "PROJECT_ROOT", str(project))
+        monkeypatch.setattr(tools, "_DOCKER_WORKDIR", "/workspace")
+        value = f"- workdir: {project}\n- data: {project / '.aura' / 'task-data'}"
+
+        monkeypatch.setattr(tools, "AURA_WORKERS_IN_DOCKER", False)
+        assert tools._worker_execution_environment_text(value) == value
+
+        monkeypatch.setattr(tools, "AURA_WORKERS_IN_DOCKER", True)
+        rewritten = tools._worker_execution_environment_text(value)
+
+        assert str(project) not in rewritten
+        assert "- workdir: /workspace" in rewritten
+        assert "- data: /workspace/.aura/task-data" in rewritten
+
+
+class TestSetupHelpers:
+    """Test setup display helpers."""
+
+    def test_mask_secret_shows_prefix_and_suffix(self):
+        from orchestrator.cli_extensions import _mask_secret
+
+        assert _mask_secret("sk-qtnC0abcdefgh1234") == "sk-qtnC0...1234"
+        assert _mask_secret("") == "(not set)"
+        assert _mask_secret("", "(disabled)") == "(disabled)"
+
+
 class TestTokenPricing:
     """Test token usage cost estimation."""
 

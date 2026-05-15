@@ -90,12 +90,18 @@ _config_path = _resolve_config_path()
 _config_data = _parse_env_file(_config_path)
 
 
+# CLI overrides (set by main.py before module execution)
+_CLI_OVERRIDES: dict[str, str] = _get_override("CLI_OVERRIDES") or {}
+
+
 def _get(key: str, default: str | None = None) -> str | None:
-    """Get a config value from the parsed file ONLY.
-    
-    Never falls back to os.environ. If the key is not in the file and no
-    default is given, returns None (callers should handle missing required keys).
+    """Get a config value — CLI overrides > config file.
+
+    Never falls back to os.environ. If the key is not in overrides or
+    the file and no default is given, returns None.
     """
+    if key in _CLI_OVERRIDES:
+        return _CLI_OVERRIDES[key]
     return _config_data.get(key, default)
 
 
@@ -211,10 +217,25 @@ WORKER_CUDA_VISIBLE_DEVICES = (_get("AURA_WORKER_CUDA_VISIBLE_DEVICES") or "").s
 # ── Layer 2 backend ─────────────────────────────────────────────────
 AURA_LAYER2_BACKEND = _get("AURA_LAYER2_BACKEND", "claude")
 AURA_CLAUDE_BIN = (_get("AURA_CLAUDE_BIN") or "").strip()
+AURA_WORKERS_IN_DOCKER = _get_bool("AURA_WORKERS_IN_DOCKER", "0")
+AURA_DOCKER_BIN = (_get("AURA_DOCKER_BIN", "docker") or "docker").strip()
+
+
+AURA_DOCKER_GPUS = (_get("AURA_DOCKER_GPUS") or "").strip()
+AURA_DOCKER_EXTRA_ARGS = (_get("AURA_DOCKER_EXTRA_ARGS") or "").strip()
+AURA_DOCKER_CLAUDE_API_KEY = _get("AURA_DOCKER_CLAUDE_API_KEY") or ""
+AURA_DOCKER_CLAUDE_BASE_URL = _get("AURA_DOCKER_CLAUDE_BASE_URL") or ""
+AURA_DOCKER_CLAUDE_MODEL = _get("AURA_DOCKER_CLAUDE_MODEL", "")
+AURA_DOCKER_CLAUDE_SMALL_MODEL = _get("AURA_DOCKER_CLAUDE_SMALL_MODEL", "")
+AURA_DOCKER_CLAUDE_SUBAGENT_MODEL = _get("AURA_DOCKER_CLAUDE_SUBAGENT_MODEL", "")
+
 AURA_DEEPSEEK_API_KEY = _get("AURA_DEEPSEEK_API_KEY") or ""
 AURA_DSCODE_MODEL = _get("AURA_DSCODE_MODEL", "deepseek-v4-pro")
 AURA_DSCODE_MAX_TURNS = _get_int("AURA_DSCODE_MAX_TURNS", str(DEFAULT_MAX_TURNS))
 AURA_DSCODE_BASE_URL = _get("AURA_DSCODE_BASE_URL") or ""
+AURA_OPENCODE_BIN = (_get("AURA_OPENCODE_BIN") or "").strip()
+AURA_OPENCODE_MODEL = _get("AURA_OPENCODE_MODEL", "deepseek-v4-pro")
+AURA_OPENCODE_MAX_TURNS = _get_int("AURA_OPENCODE_MAX_TURNS", str(DEFAULT_MAX_TURNS))
 AURA_SEARCH_API_KEY = _get("AURA_SEARCH_API_KEY", "")
 
 # ── Memory / stuck detection ─────────────────────────────────────────

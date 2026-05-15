@@ -58,7 +58,7 @@ Aura gives you:
 - Task-file change detection while the orchestrator is already running
 - External wake-up with `aura wake`
 - Local project checkpoints under `.aura/`
-- Support for both `claude` and `ds_code` worker backends
+- Support for `claude`, `ds_code`, and `opencode` worker backends
 
 ## How It Works
 
@@ -128,6 +128,7 @@ Requirements:
 - One Layer 2 backend:
   - `claude`: Claude Code CLI available as `claude`
   - `ds_code`: `ds-code` CLI available as `ds-code`
+  - `opencode`: OpenCode CLI available as `opencode`
 
 Install locally:
 
@@ -205,14 +206,15 @@ Important environment variables:
 | `AURA_API_BASE_URL` | `https://api.deepseek.com/anthropic` | Anthropic-compatible API endpoint |
 | `AURA_API_MODEL` | `deepseek-v4-pro` | Layer 1 model |
 | `AURA_API_PROVIDER` | (auto-detected) | Provider type: deepseek / anthropic / openai |
-| `AURA_LAYER2_BACKEND` | `claude` | `claude` or `ds_code` |
+| `AURA_LAYER2_BACKEND` | `claude` | `claude`, `ds_code`, or `opencode` |
 | `AURA_CYCLE_INTERVAL` | `300` | Wake interval in seconds |
 | `AURA_DEEP_REVIEW_INTERVAL` | `12` | Review interval in cycles |
 | `AURA_API_MAX_TOKENS` | `4096` | Max output tokens per Layer 1 API call |
 | `AURA_MAX_CONCURRENT_TASKS` | `2` | Max concurrent Layer 2 workers |
 | `AURA_TASK_BUDGET` | `30` | Default Layer 2 worker budget in minutes |
-| `AURA_MAX_TURNS` | `50` | Max turns for Claude Code workers |
+| `AURA_MAX_TURNS` | `50` | Max turns per Layer 2 worker |
 | `AURA_DSCODE_MODEL` | `deepseek-v4-pro` | ds-code model when using `AURA_LAYER2_BACKEND=ds_code` |
+| `AURA_OPENCODE_MODEL` | `deepseek-v4-pro` | OpenCode model when using `AURA_LAYER2_BACKEND=opencode` |
 | `AURA_WORKER_RESOURCE_GUARD` | `1` | Enable worker resource preflight and watchdog checks |
 | `AURA_WORKER_RESOURCE_AVG_WINDOW_SECONDS` | `180` | Rolling window used before sustained resource violations count |
 | `AURA_WORKER_RESOURCE_VIOLATION_STRIKES` | `3` | Consecutive rolling-window violations before killing a worker |

@@ -40,6 +40,9 @@ credentials.json
 *.log
 logs/
 
+# Local Docker publish helpers (not part of source)
+.docker/
+
 # Local backups and generated reports
 *.bak
 *.bak2

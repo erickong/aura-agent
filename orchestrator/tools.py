@@ -13,9 +13,10 @@ from datetime import datetime
 from typing import Any
 
 from . import process_mgr
+from .process_mgr import DockerImageBuildError, _DOCKER_WORKDIR
 from . import state as state_mgr
 from . import memory as memory_mgr
-from .config import get_workspace_dir
+from .config import AURA_WORKERS_IN_DOCKER, PROJECT_ROOT, get_workspace_dir
 from .file_cache import cached_read_file, cached_list_directory, invalidate_cache
 
 MIN_EXECUTABLE_TASK_DEPTH = 2
@@ -136,7 +137,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "spawn_task",
-        "description": "Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
+        "description": "Start a new Layer 2 worker to execute a concrete leaf task. Only spawn tasks at ROOT -> category -> task level or deeper; top-level ROOT children are planning categories, not executable tasks.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -793,8 +794,32 @@ def _format_sibling_context(task_id: str, state: dict) -> str:
     return "\n".join(lines)
 
 
+def _worker_location_prompt(task_dir: str) -> str:
+    if AURA_WORKERS_IN_DOCKER:
+        try:
+            rel = os.path.relpath(task_dir, PROJECT_ROOT)
+            container_task_dir = "/" + "/".join([_DOCKER_WORKDIR.strip("/"), *rel.split(os.sep)])
+        except ValueError:
+            container_task_dir = _DOCKER_WORKDIR
+        return (
+            f"- Current working directory: {container_task_dir}\n"
+            f"- This current directory is the task output directory. Put all outputs here. Project root is {_DOCKER_WORKDIR}; translate host paths under {PROJECT_ROOT} to {_DOCKER_WORKDIR}."
+        )
+    return (
+        f"- Current working directory: {task_dir}\n"
+        "- This current directory is the task output directory. Put all outputs here."
+    )
+
+
+def _worker_execution_environment_text(value: str) -> str:
+    if not AURA_WORKERS_IN_DOCKER:
+        return value or "(not set)"
+    text = value or "(not set)"
+    return text.replace(PROJECT_ROOT, _DOCKER_WORKDIR).replace("\\", "/")
+
+
 def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) -> str:
-    """Spawn a Layer 2 Claude Code worker."""
+    """Spawn a Layer 2 worker process."""
     from .config import DEFAULT_MAX_TURNS, MAX_CONCURRENT_TASKS
 
     state = state_mgr.load_state()
@@ -815,11 +840,14 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
         return f"ERROR: Task {task_id} is {task.get('status')} and cannot be spawned."
 
     project_context = state.get("project_context", {}) or {}
+    execution_environment = _worker_execution_environment_text(
+        project_context.get("execution_environment") or "(not set)"
+    )
     project_context_text = "\n".join([
         f"- Final goal: {project_context.get('final_goal') or '(not set)'}",
         f"- Success criteria: {project_context.get('success_criteria') or '(not set)'}",
         f"- Global constraints: {project_context.get('global_constraints') or '(not set)'}",
-        f"- Execution environment: {project_context.get('execution_environment') or '(not set)'}",
+        f"- Execution environment: {execution_environment}",
         f"- Notes: {project_context.get('notes') or '(not set)'}",
     ])
     hierarchy_context_text = _format_task_hierarchy_context(task_id, state)
@@ -837,6 +865,7 @@ def impl_spawn_task(task_id: str, description: str, budget_minutes: int = 30) ->
     ws_dir = get_workspace_dir()
     task_dir = os.path.join(ws_dir, "tasks", task_id)
     os.makedirs(task_dir, exist_ok=True)
+    location_prompt = _worker_location_prompt(task_dir)
 
     # Write task definition
     # IMPORTANT: Always overwrite task.md with the CORRECT description.
@@ -913,8 +942,7 @@ category.
 ## Constraints
 - Budget: {budget_minutes} minutes
 - Max turns: {DEFAULT_MAX_TURNS}
-- Current working directory: {task_dir}
-- This current directory is the task output directory. Put all outputs here.
+{location_prompt}
 """
     with open(task_md_path, "w", encoding="utf-8") as f:
         f.write(task_content)
@@ -1190,13 +1218,19 @@ def get_active_tool_definitions() -> list[dict]:
     Tools whose required configuration is not set are excluded.
     Currently: web_search is hidden when AURA_SEARCH_API_KEY is empty.
     """
-    from .config import AURA_SEARCH_API_KEY, MAX_CONCURRENT_TASKS
+    from .config import AURA_SEARCH_API_KEY, AURA_LAYER2_BACKEND, MAX_CONCURRENT_TASKS
+
+    backend_label = {
+        "claude": "Claude Code CLI",
+        "ds_code": "ds-code CLI",
+        "opencode": "OpenCode CLI",
+    }.get(AURA_LAYER2_BACKEND, "Layer 2 worker")
 
     active = [dict(t) for t in TOOL_DEFINITIONS]
     for tool in active:
         if tool.get("name") == "spawn_task":
             tool["description"] = (
-                f"Start a new Layer 2 worker (Claude Code CLI) to execute a concrete leaf task. "
+                f"Start a new Layer 2 worker ({backend_label}) to execute a concrete leaf task. "
                 f"Maximum {MAX_CONCURRENT_TASKS} concurrent workers. Only spawn tasks at "
                 "ROOT -> category -> task level or deeper; top-level ROOT children are "
                 "planning categories, not executable tasks."
@@ -1213,5 +1247,7 @@ def execute_tool(name: str, params: dict[str, Any]) -> str:
         return f"ERROR: Unknown tool: {name}"
     try:
         return impl(**params)
+    except DockerImageBuildError:
+        raise
     except Exception as e:
         return f"ERROR executing tool '{name}': {e}"
